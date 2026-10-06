@@ -33,8 +33,7 @@ from functools import partial
 import gradio as gr
 from PIL import Image
 
-from modules import images, processing, script_callbacks, scripts, shared
-from modules.infotext_utils import parse_generation_parameters
+from modules import call_queue, images, processing, script_callbacks, scripts, shared
 from modules_forge import main_thread
 
 import batch_adetailer_shared as bshared
@@ -129,17 +128,16 @@ def _register_settings():
 # ──────────────────────────────────────────────
 # Test-folder scanning — shared core, parameterized by this stage's record.
 #
-# ADetailer runs FIRST in the refine chain:
-#   NrM.png -> NrM-adetailer.png -> NrM-adetailer-base.png / NrM-adetailer-hires.png
-# A base image is "pending" while it has no -adetailer successor. Bases with a
-# plain -hires sibling went through the old (hires-first) chain and are left
-# alone. Compositional edits are new revisions (1r2), never suffixes.
+# ADetailer runs SECOND in the refine chain, on the hires-fix results:
+#   NrM.png -> NrM-hires.png -> NrM-hires-adetailer.png
+# A -hires image is "pending" while it has no -adetailer (or -edited) successor.
+# Compositional edits are new revisions (1r2), never suffixes.
 # ──────────────────────────────────────────────
-def _base_images(folder):
+def _hires_images(folder):
     return bshared.stage_inputs(folder, STAGE)
 
 
-def _pending_bases(folder):
+def _pending_hires(folder):
     return bshared.pending_inputs(folder, STAGE)
 
 
@@ -263,7 +261,7 @@ def _slot_values_from_unit(preset_index, unit):
         str(unit.get("ad_prompt", "") or ""),
         str(unit.get("ad_negative_prompt", "") or ""),
         float(unit.get("ad_confidence", 0.3)),
-        float(unit.get("ad_denoising_strength", 0.4)),
+        float(unit.get("ad_denoising_strength", 0.5)),
         float(unit.get("ad_mask_max_ratio", 1.0)),
     ]
 
@@ -394,6 +392,35 @@ def _fix_infotext(infotext: str | None, width: int, height: int, steps: int | No
     return infotext
 
 
+_SEP_RE = re.compile(r"\s*\[SEP\]\s*")
+
+
+def _collapse_prompt_editing(unit_dicts, p):
+    """
+    ADetailer re-samples each face from step 0, so `[from:to:7]` in the source
+    prompt would inpaint `from` again for 7 steps. Resolve the blank/[PROMPT]
+    fallback to the state the finished image was left in. Explicitly authored
+    ADetailer schedules are left for its inpaint pass to run normally.
+
+    Collapse only the fallback, before inserting it into each [SEP] segment:
+    final_prompt parks LoRA tags at the end of its input, so passing the joined
+    face prompts would move every face's LoRA into the last segment. The image's
+    own Prompt metadata is untouched. p.styles are already folded into p.prompt.
+    """
+    fallbacks = {"ad_prompt": p.prompt, "ad_negative_prompt": p.negative_prompt}
+    for unit in unit_dicts:
+        for key, fallback in fallbacks.items():
+            parts = _SEP_RE.split(unit.get(key, "") or "")
+            if not any(not part or "[PROMPT]" in part for part in parts):
+                continue
+            final = bshared.final_prompt(fallback, p.steps)
+            if final != fallback:  # no source schedules -> let ADetailer resolve it
+                unit[key] = "[SEP]".join(
+                    final if not part else part.replace("[PROMPT]", final)
+                    for part in parts
+                )
+
+
 # ──────────────────────────────────────────────
 # Core Processing Logic
 # ──────────────────────────────────────────────
@@ -415,10 +442,6 @@ def _process_single_image(img: Image.Image, geninfo: str | None, unit_dicts: lis
                 text = _BASE_PROMPT_RE.sub("[PROMPT]", unit.get(key, "") or "")
                 unit[key], found = bshared.fix_lora_names(text)
                 notes += found
-
-        script_args, _warning = _assemble_script_args(unit_dicts)
-        if script_args is None:
-            return [], [], _warning, notes
 
         p = processing.StableDiffusionProcessingImg2Img(
             outpath_samples=(
@@ -453,15 +476,33 @@ def _process_single_image(img: Image.Image, geninfo: str | None, unit_dicts: lis
             override_settings={},
         )
 
+        # Scripts are assigned HERE, before the image's own parameters are
+        # applied: steps, sampler, scheduler and seed are alwayson scripts in
+        # Forge (modules/processing_scripts/sampler.py :: setup, seed.py ::
+        # setup), and the scripts/script_args setters run setup_scripts() the
+        # moment both are set (processing.py :: script_args.setter). Assigning
+        # them *after* apply_source_image_parameters lets those setups overwrite
+        # every inherited value with the live img2img UI's (20 steps, DPM++ 2M,
+        # Normal, random seed) — which silently neuters the inpaint.
+        # The real ADetailer args are swapped in further down, once the prompts
+        # they carry are final.
         p.scripts = scripts.scripts_img2img
-        p.script_args = script_args
+        p.script_args = bshared.get_default_script_args(
+            scripts.scripts_img2img, "img2img").copy()
 
         if geninfo:
             # ADetailer's inpaint pass inherits these: an empty ad_prompt falls
             # back to p.prompt, and with skip-img2img the steps/sampler it uses
             # come from p (captured into p._ad_orig before the base pass is
             # neutered).
-            bshared.apply_source_image_parameters(p, geninfo)
+            params = bshared.apply_source_image_parameters(p, geninfo)
+            # Fold the recovered styles in now: ADetailer's blank/[PROMPT] fallback
+            # reads the already-styled p.all_prompts and then builds its inpaint
+            # with styles=p.styles, which would apply every style a second time.
+            p.prompt = shared.prompt_styles.apply_styles_to_prompt(p.prompt, p.styles)
+            p.negative_prompt = shared.prompt_styles.apply_negative_styles_to_prompt(
+                p.negative_prompt, p.styles)
+            p.styles = []
 
         # A slot with a blank ADetailer prompt inpaints with *this* prompt (ADetailer
         # falls back to p.all_prompts), so a LoRA that can't be resolved here is a
@@ -471,7 +512,29 @@ def _process_single_image(img: Image.Image, geninfo: str | None, unit_dicts: lis
         p.negative_prompt, found = bshared.fix_lora_names(p.negative_prompt)
         notes += found
 
+        # An image made with Stagehand's Character Prompts carries its characters as lines
+        # in the prompt. Inlined into the units here, every face would get every character;
+        # Stagehand gives each face its own character and resolves the schedules itself.
+        if not bshared.has_characters(p.prompt):
+            _collapse_prompt_editing(unit_dicts, p)
+
+        script_args, _warning = _assemble_script_args(unit_dicts)
+        if script_args is None:
+            return [], [], _warning, notes
+        if geninfo:
+            # Scripts that can rebuild their settings from the image's own get them, so its
+            # metadata carries them on to the hires tab (Stagehand's Precise Reference).
+            bshared.replay_script_args(scripts.scripts_img2img, script_args, params)
+
+        # Plain reassignment: setup_scripts() already ran above (guarded by
+        # scripts_setup_complete), so this only swaps ADetailer's slice in — it
+        # can't re-run the core setups and clobber the inherited parameters.
+        # ADetailer itself has no setup(), so it loses nothing by being late.
+        p.script_args = script_args
+
         print(f"[Batch ADetailer] base prompt: {p.prompt!r}")
+        print(f"[Batch ADetailer] steps={p.steps} sampler={p.sampler_name!r} "
+              f"scheduler={getattr(p, 'scheduler', None)!r} seed={p.seed}")
         if p.styles:
             print(f"[Batch ADetailer] styles: {p.styles}")
         for note in dict.fromkeys(notes):
@@ -484,9 +547,10 @@ def _process_single_image(img: Image.Image, geninfo: str | None, unit_dicts: lis
         orig_steps = p.steps
         orig_sampler = p.sampler_name
 
-        if save_opts.get("use_original_name"):
-            # We save manually afterwards with the original filename + suffix.
-            p.do_not_save_samples = True
+        # Always saved by hand afterwards: core's own save would write the
+        # skip-img2img infotext (Steps: 1, Euler, 128x128), and the hires tab
+        # then inherits a 1-step pass from it.
+        p.do_not_save_samples = True
 
         with closing(p):
             processed = scripts.scripts_img2img.run(p, *p.script_args)
@@ -494,18 +558,21 @@ def _process_single_image(img: Image.Image, geninfo: str | None, unit_dicts: lis
             if processed is None:
                 processed = processing.process_images(p)
 
-        if shared.state.interrupted or shared.state.stopping_generation:
+        if shared.state.interrupted or shared.state.stopping_generation or shared.state.skipped:
             # An interrupted inpaint returns a partial/unfinished result;
             # saving it would make the image look finished (and with
             # save-to-source would hide it from the pending scan forever) —
             # drop it instead.
             return [], [], None, notes
 
+        fix_info = lambda t: _fix_infotext(t, orig_size[0], orig_size[1], orig_steps, orig_sampler)
         if save_opts.get("use_original_name"):
-            bshared.save_with_original_name(
-                processed, p, save_opts,
-                fix_info=lambda t: _fix_infotext(t, orig_size[0], orig_size[1],
-                                                 orig_steps, orig_sampler))
+            bshared.save_with_original_name(processed, p, save_opts, fix_info=fix_info)
+        else:
+            for i, image in enumerate(processed.images):
+                info = processed.infotexts[i] if i < len(processed.infotexts) else None
+                images.save_image(image, p.outpath_samples, "", p.all_seeds[0], p.all_prompts[0],
+                                  shared.opts.samples_format, info=fix_info(info), p=p)
 
         return processed.images, processed.infotexts, None, notes
     except Exception:
@@ -659,15 +726,21 @@ def batch_adetailer_process(store, paths, sel, use_original_name, filename_suffi
         # otherwise stay True forever after a UI reload (request_restart calls
         # interrupt()) and make process_images_inner return 0 images silently.
         # Real generations get this from the UI's wrap_gradio_gpu_call wrapper.
-        shared.state.begin(job="batch_adetailer")
-        try:
-            # GPU work must run on Forge's main thread, same as img2img()
-            # (img2img.py routes through main_thread.run_and_wait_result).
-            result_images, _infotexts, error_tb, notes = main_thread.run_and_wait_result(
-                _process_single_image, img, geninfo, unit_dicts, save_opts
-            )
-        finally:
-            shared.state.end()
+        # queue_lock, like wrap_gradio_gpu_call: without it a txt2img/API job and
+        # this image would share shared.state, each begin()/end() clobbering the other.
+        with call_queue.queue_lock:
+            shared.state.begin(job="batch_adetailer")
+            try:
+                # GPU work must run on Forge's main thread, same as img2img()
+                # (img2img.py routes through main_thread.run_and_wait_result).
+                result_images, _infotexts, error_tb, notes = main_thread.run_and_wait_result(
+                    _process_single_image, img, geninfo, unit_dicts, save_opts
+                )
+            finally:
+                # Read before end() and inside the lock: once released, the next
+                # job's begin() resets these flags.
+                stopped = shared.state.interrupted or shared.state.stopping_generation
+                shared.state.end()
 
         shared.total_tqdm.clear()
 
@@ -683,7 +756,7 @@ def batch_adetailer_process(store, paths, sel, use_original_name, filename_suffi
 
         # Cancel/Interrupt pressed during this image: report and stop the batch.
         # (Checked before the next begin(), which would reset shared.state's flags.)
-        if bshared.cancel_requested(STAGE, my_run) or shared.state.interrupted or shared.state.stopping_generation:
+        if bshared.cancel_requested(STAGE, my_run) or stopped:
             status_messages.append(
                 f"⏹️ [{idx + 1}/{total}] Cancelled during {name} — stopping batch."
             )
@@ -831,32 +904,13 @@ def _on_select_image(store, paths, num_slots, evt: gr.SelectData):
     ]
 
 
-def _image_prompt_head(path, n_lines=3):
-    """First `n_lines` of the positive prompt embedded in the image at `path`
-    (read from its PNG generation info), or "" if there's nothing to read."""
-    try:
-        with Image.open(path) as img:
-            geninfo, _ = images.read_info_from_image(img)
-    except Exception:
-        return ""
-    if not geninfo:
-        return ""
-    try:
-        prompt = parse_generation_parameters(geninfo).get("Prompt", "") or ""
-    except Exception:
-        # Fall back to the raw first block before the Negative prompt / params.
-        prompt = geninfo.split("Negative prompt:")[0].strip()
-    return "\n".join(prompt.splitlines()[:n_lines]).strip()
-
-
 def _on_right_click(store, paths, index, num_slots, img2img_prompt=""):
     """
     Thumbnail right-clicked (via javascript/batch_adetailer.js, which puts the
     index in a hidden textbox and clicks a hidden button): select that image and
-    fill Slot 1's ADetailer prompt with the first 3 lines of that image's own
-    prompt, read from its embedded generation info. If the image has no embedded
-    prompt, fall back to the first 3 lines of the live img2img prompt (stashed by
-    the JS). If neither has anything, the slot is left untouched. Everything else
+    fill Slot 1's ADetailer prompt with that image's entire prompt, read from its
+    embedded generation info. If the image has no embedded prompt, fall back to
+    the live img2img prompt (stashed by the JS). If neither has anything, the slot is left untouched. Everything else
     about the slot is left as is.
     """
     paths = list(paths or [])
@@ -873,12 +927,17 @@ def _on_right_click(store, paths, index, num_slots, img2img_prompt=""):
     config = list(
         store.get(paths[idx]) or _default_config(_get_adetailer_defaults(), num_slots)
     )
-    head = _image_prompt_head(paths[idx], 3)
-    if not head:
+    prompt = bshared.image_prompt(paths[idx])
+    if not prompt:
         # No prompt baked into the image — fall back to the live img2img prompt.
-        head = "\n".join((img2img_prompt or "").splitlines()[:3]).strip()
-    if head:
-        config[1] = head  # slot 1's prompt — position 0 is its preset dropdown
+        prompt = (img2img_prompt or "").strip()
+    if bshared.has_characters(prompt):
+        # A Stagehand image (or a live prompt with character lines): written out here, every
+        # face would get every character (and the labels). [PROMPT] lets Stagehand give each
+        # face its own character's prompt.
+        prompt = "[PROMPT]"
+    if prompt:
+        config[1] = prompt  # slot 1's prompt — position 0 is its preset dropdown
     store[paths[idx]] = config
 
     return [
@@ -917,6 +976,10 @@ def _on_preset_change(store, paths, sel, preset, slot, num_slots):
     if sel is not None and paths and 0 <= int(sel) < len(paths):
         path = paths[int(sel)]
         config = list(store.get(path) or _default_config(defaults, num_slots))
+        # .change also fires when selecting/importing an image sets the dropdown to
+        # that image's stored preset; refilling then would wipe its saved prompts.
+        if config[slot * CONTROLS_PER_SLOT] == preset_idx:
+            return [store, *[gr.update() for _ in values[1:]]]
         config[slot * CONTROLS_PER_SLOT : (slot + 1) * CONTROLS_PER_SLOT] = values
         store[path] = config
 
@@ -958,14 +1021,14 @@ def _on_apply_to_all(store, paths, sel, *control_values):
     )
 
 def _export_prompts(store, paths, folder):
-    """Snapshot every loaded image's slot configs (keyed by filename) into a
+    """Snapshot every loaded image's slot configs (keyed by <set>/<file>) into a
     timestamped JSON file, so the per-image prompts survive a restart."""
     if not paths:
         return "Nothing to export — load images first."
     folder = (folder or "").strip().strip('"')
     if not folder:
         return "Set an export folder first."
-    data = {os.path.basename(p): (store or {}).get(p) for p in paths}
+    data = {bshared.export_key(p): (store or {}).get(p) for p in paths}
     data = {k: v for k, v in data.items() if v}
     if not data:
         return "Nothing to export — no per-image settings yet."
@@ -977,8 +1040,8 @@ def _export_prompts(store, paths, folder):
 
 
 def _import_prompts(file, store, paths, sel, num_slots):
-    """Merge an exported JSON back onto the loaded images, matched by filename
-    (full paths differ between sessions — gradio temp copies, moved folders).
+    """Merge an exported JSON back onto the loaded images, matched by <set>/<file>, else
+    a unique filename (full paths differ between sessions — gradio temp copies, moved folders).
     Returns [store, *control updates, status]."""
     noop = [gr.update()] * (num_slots * CONTROLS_PER_SLOT)
     path = file if isinstance(file, str) else getattr(file, "name", None)
@@ -1000,7 +1063,7 @@ def _import_prompts(file, store, paths, sel, num_slots):
     store = dict(store or {})
     matched = 0
     for p in paths:
-        cfg = data.get(os.path.basename(p))
+        cfg = bshared.lookup_export(data, p)
         if not isinstance(cfg, list):
             continue
         base = list(store.get(p) or _default_config(_get_adetailer_defaults(), num_slots))
@@ -1075,7 +1138,7 @@ def _slot_controls(slot_index, num_slots):
         )
         denoising_strength = gr.Slider(
             minimum=0.0, maximum=1.0, step=0.01,
-            value=0.4, label="Inpaint denoising strength",
+            value=0.5, label="Inpaint denoising strength",
         )
 
     mask_max_ratio = gr.Slider(
@@ -1096,8 +1159,8 @@ def _build_ui_tab():
             "Each slot pulls its model and settings from one of your ADetailer units "
             "(as saved in the img2img panel) — you only override what varies per image. "
             "Slot order is the order the units run in.\n\n"
-            "*Right-click a thumbnail to fill Slot 1's prompt with the first 3 lines of "
-            "that image's own prompt (read from its metadata), or the img2img prompt if "
+            "*Right-click a thumbnail to fill Slot 1's prompt with "
+            "that image's entire prompt (read from its metadata), or the img2img prompt if "
             "the image has none. ←/→ steps through the thumbnails (when you're not typing "
             "in a box).*"
         )
@@ -1170,7 +1233,7 @@ def _build_ui_tab():
         rclick_prompt = gr.Textbox(visible=False, elem_id="batch_adetailer_rclick_prompt")
         rclick_btn = gr.Button(visible=False, elem_id="batch_adetailer_rclick_btn")
 
-        with gr.Accordion("📁 Test Folders — load pending base images", open=True):
+        with gr.Accordion("📁 Test Folders — load pending -hires images", open=True):
             folder_select = _folder_choices()
             with gr.Row():
                 load_btn = gr.Button("📥 Load Selected Folders", variant="primary", scale=3)
@@ -1181,7 +1244,7 @@ def _build_ui_tab():
             # all. This loads any folder as-is, done or not.
             with gr.Row():
                 folder_path = gr.Textbox(
-                    label="…or load every base image in one folder, done or not",
+                    label="…or load every -hires image in one folder, done or not",
                     placeholder=r"C:\art\Commission 12 - Example",
                     max_lines=1,
                     scale=4,
@@ -1200,7 +1263,7 @@ def _build_ui_tab():
                 scale=4,
             )
             suffix_filter = gr.Textbox(
-                value="",
+                value="-hires",
                 label="Only load files ending with",
                 info="Drag a whole folder's worth in — anything else is skipped. Empty = load everything.",
                 max_lines=1,
@@ -1390,12 +1453,12 @@ def _build_ui_tab():
         )
 
         def _load_folders(folders, store, pending_only=True, empty_msg=None):
-            """Base images of the given folders, loaded directly — NOT through the
+            """-hires images of the given folders, loaded directly — NOT through the
             drop zone: gradio copies every value that round-trips a gr.File into
             its temp cache, and save-to-source derives the output folder from each
             path, so the paths must stay the originals for results to land back in
             the source folders. Also ticks save-to-source."""
-            pick = _pending_bases if pending_only else _base_images
+            pick = _pending_hires if pending_only else _hires_images
             folders = [f for f in (folders or []) if f]
             # A ticked set covers its own folder AND its Tests folder. The 📂
             # path box stays literal: pending_only=False loads exactly one dir.
@@ -1405,7 +1468,7 @@ def _build_ui_tab():
             if not files:
                 noop = [gr.update()] * (6 + num_slots * CONTROLS_PER_SLOT)
                 return [*noop, gr.update(), empty_msg or (
-                    "No pending base images — tick at least one set "
+                    "No pending -hires images — tick at least one set "
                     "(🔄 Rescan if the list is stale)."
                 )]
             return [*_load_paths(files, store, num_slots), gr.update(value=True), (
@@ -1427,8 +1490,8 @@ def _build_ui_tab():
         load_path_btn.click(
             fn=lambda path, store: _load_folders(
                 [(path or "").strip().strip('"')], store, pending_only=False,
-                empty_msg="No base images in that folder — check the path. "
-                          "(-adetailer / -hires / -edited / -base files aren't bases.)",
+                empty_msg="No -hires images in that folder — check the path. "
+                          "(This stage's inputs are <name>-hires.png files.)",
             ),
             inputs=[folder_path, store_state],
             outputs=folder_outputs,
@@ -1471,7 +1534,7 @@ def _build_ui_tab():
             fn=batch_adetailer_run_selected,
             inputs=run_inputs,
             outputs=[status_text],
-        )
+        ).then(fn=_folder_choices, inputs=[], outputs=[folder_select])
 
     return block
 

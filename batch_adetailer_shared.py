@@ -2,7 +2,7 @@
 Shared core for the Batch ADetailer / Batch Hires-Fix tabs.
 
 Both tabs work the same refine pipeline over commission/request sets:
-    NrM.png -> NrM-adetailer.png -> NrM-adetailer-base.png / NrM-adetailer-hires.png
+    NrM.png -> NrM-hires.png (+ NrM-base.png if ticked) -> NrM-hires-adetailer.png
 and share everything that isn't stage-specific: set scanning, revision picking,
 dragged-file resolution, default script args, LoRA repair, infotext
 inheritance, original-name saving, and batch cancelling. The stage differences
@@ -24,6 +24,7 @@ import tempfile
 import weakref
 
 import gradio as gr
+from PIL import Image
 
 from modules import images, shared
 from modules.infotext_utils import parse_generation_parameters
@@ -46,43 +47,46 @@ class Stage:
         self.empty_label = empty_label      # ... when nothing is; .format(roots=...)
 
 
-ADETAILER_STAGE = Stage(
-    name="Batch ADetailer",
-    opt_prefix="batch_adetailer",
+# Hires-fix runs FIRST (on the plain bases), ADetailer second (on the -hires
+# results): NrM.png -> NrM-hires.png -> NrM-hires-adetailer.png.
+HIRES_STAGE = Stage(
+    name="Batch Hires-Fix",
+    opt_prefix="batch_hires_fix",
     # `<image>r<revision>` naming: 1r1, 1r2, 10r13. Digits-only prefix on purpose —
     # a looser match would swallow names like flower2.png.
     revision_re=re.compile(r"^(\d+)r(\d+)$", re.IGNORECASE),
     # Pipeline outputs (-adetailer, -hires, -edited, -base) and their collision
     # copies are not bases.
     is_input=lambda stem: not any(tok in stem.lower() for tok in _VARIANT_TOKENS),
-    # A base with a plain -hires sibling went through the old hires-first chain
-    # and is left alone.
-    done_suffixes=("-adetailer", "-hires"),
-    pending_label="Sets with base images that have no -adetailer version yet",
+    # A base with a plain -adetailer sibling went through the old adetailer-first
+    # chain and is left alone; an -edited one was finished by hand.
+    done_suffixes=("-hires", "-adetailer", "-edited"),
+    pending_label=("Sets with base images that have no -hires version yet — "
+                   "results save back into the set's folder"),
     empty_label=(
-        "Nothing pending — every set under {roots} already has -adetailer "
+        "Nothing pending — every set under {roots} already has -hires "
         "results. Load a folder by path below, or widen the roots in "
-        "Settings → Batch ADetailer. (A set is a folder with a Tests "
+        "Settings → Batch Hires-Fix. (A set is a folder with a Tests "
         "subfolder, or any folder inside a Requests folder.)"
     ),
 )
 
-HIRES_STAGE = Stage(
-    name="Batch Hires-Fix",
-    opt_prefix="batch_hires_fix",
-    # Same naming with this stage's input suffix: 1r1-adetailer, 10r13-adetailer.
-    revision_re=re.compile(r"^(\d+)r(\d+)-adetailer$", re.IGNORECASE),
-    # The endswith test also excludes this stage's own outputs (-adetailer-base,
-    # -adetailer-hires) and collision copies (-adetailer-1).
-    is_input=lambda stem: stem.endswith("-adetailer"),
+ADETAILER_STAGE = Stage(
+    name="Batch ADetailer",
+    opt_prefix="batch_adetailer",
+    # Same naming with this stage's input suffix: 1r1-hires, 10r13-hires.
+    revision_re=re.compile(r"^(\d+)r(\d+)-hires$", re.IGNORECASE),
+    # The endswith test also excludes this stage's own outputs (-hires-adetailer)
+    # and collision copies (-hires-1).
+    is_input=lambda stem: stem.endswith("-hires"),
     # One that's been hand-edited past this stage counts as done too.
-    done_suffixes=("-hires", "-edited"),
-    pending_label=("Sets with -adetailer images that have no -hires version yet — "
+    done_suffixes=("-adetailer", "-edited"),
+    pending_label=("Sets with -hires images that have no -adetailer version yet — "
                    "results save back into the set's folder"),
     empty_label=(
-        "Nothing pending — every -adetailer image under {roots} already has "
-        "a -hires version. Load a folder by path below, or widen the roots "
-        "in Settings → Batch Hires-Fix. (A set is a folder with a Tests "
+        "Nothing pending — every -hires image under {roots} already has "
+        "an -adetailer version. Load a folder by path below, or widen the roots "
+        "in Settings → Batch ADetailer. (A set is a folder with a Tests "
         "subfolder, or any folder inside a Requests folder.)"
     ),
 )
@@ -106,6 +110,25 @@ def display_name(path):
     if os.path.basename(parent).lower() == "tests":
         parent = os.path.dirname(parent)
     return f"{os.path.basename(parent)}/{os.path.basename(path)}"
+
+
+def export_key(path):
+    """Key for a per-image export entry. `<set>/<file>`, not the bare filename:
+    every set has a 1r1.png, and bare names made three sets' entries collapse
+    into one that import then applied to all three."""
+    return display_name(path)
+
+
+def lookup_export(data, path):
+    """The export entry for `path`: its `<set>/<file>` key, else the one entry
+    with the same filename (moved folders, drag-drop temp copies, and exports
+    written before keys carried the set). Ambiguous -> None, never a guess."""
+    key = export_key(path)
+    if key in data:
+        return data[key]
+    name = os.path.basename(path)
+    hits = [v for k, v in data.items() if k.replace("\\", "/").rsplit("/", 1)[-1] == name]
+    return hits[0] if len(hits) == 1 else None
 
 
 def is_dragged_temp_copy(path):
@@ -446,8 +469,102 @@ def fix_lora_names(text: str):
 
 
 # ──────────────────────────────────────────────
+# Prompt editing: [from:to:N] / [to:N] / [from::N]
+#
+# A later pass that re-samples from step 0 (ADetailer's inpaint) would replay
+# the schedule and spend its first N steps on `from`. What the finished image
+# actually shows is the state at its *last* step, so collapse each schedule to
+# that. Uses Forge's own grammar, so [a|b] alternation and (emphasis) survive.
+# The hires pass needs none of this: Forge offsets schedules by the first-pass
+# steps there (prompt_parser, hires_steps), so it already lands on `to`.
+# ──────────────────────────────────────────────
+_EXTRA_NET_RE = re.compile(r"<\w+:[^>]+>")  # modules/extra_networks.py re_extra_net
+
+
+def final_prompt(text: str, steps: int) -> str:
+    """`text` with every [from:to:N] schedule resolved to its state at step `steps`."""
+    if not text or "[" not in text:
+        return text
+
+    import lark
+    from modules import prompt_parser
+
+    class Final(lark.Transformer):
+        def scheduled(self, args):
+            before, after, _, when, _ = args
+            s = str(when)
+            n = int(float(s) * steps) if "." in s else int(float(s))
+            # Same test Forge applies at the last step: `step <= when` keeps `from`.
+            return (before or "") if n >= steps else (after or "")
+
+        def alternate(self, args):
+            return "[" + "|".join(a or "" for a in args) + "]"
+
+        def __default__(self, data, children, meta):
+            return "".join(str(c) for c in children if c is not None)
+
+    # Forge pulls <lora:...> out before it schedules (extra_networks.parse_prompts),
+    # so a LoRA in either branch was active the whole time — and its colons
+    # would derail the grammar. Park them and put them back at the end.
+    nets = _EXTRA_NET_RE.findall(text)
+    body = _EXTRA_NET_RE.sub("", text)
+    try:
+        final = Final().transform(prompt_parser.schedule_parser.parse(body))
+    except Exception:
+        return text  # Forge falls back to the literal text on a parse error; so do we.
+    if final == body:
+        return text
+    return ", ".join([final.strip(" ,")] + nets) if nets else final
+
+
+# ──────────────────────────────────────────────
 # Infotext extraction
 # ──────────────────────────────────────────────
+def image_prompt(path):
+    """The whole positive prompt baked into the image at `path`, parsed the same
+    way apply_source_image_parameters() parses it, or "" if there's nothing to
+    read. Feeds the ADetailer right-click fill and the hires prompt editor."""
+    try:
+        with Image.open(path) as img:
+            geninfo, _ = images.read_info_from_image(img)
+    except Exception:
+        return ""
+    if not geninfo:
+        return ""
+    try:
+        return (parse_generation_parameters(geninfo, []).get("Prompt", "") or "").strip()
+    except Exception:
+        # Malformed infotext: the raw first block is still the prompt.
+        return geninfo.split("Negative prompt:")[0].strip()
+
+
+# forge-stagehand's Character Prompts writes each character as a line under the main prompt
+# ("Character 2 (Lan): girl, ..."); see its lib_stagehand/characters.py.
+_CHARACTER_LINE_RE = re.compile(r"^Character \d+(?: \(.*?\))?(?: at (?:(?:[\d.]+ ){3}[\d.]+|[A-E][1-5]))?:", re.M)
+
+
+def has_characters(prompt: str) -> bool:
+    """Whether a prompt carries Stagehand characters."""
+    return bool(_CHARACTER_LINE_RE.search(prompt or ""))
+
+
+def replay_script_args(runner, script_args, params):
+    """Let alwayson scripts that can rebuild their own args from an image's infotext do so
+    (a script opts in with `args_from_infotext(params) -> list | None`); the rest keep their
+    UI defaults. A failing script is reported and left at its defaults."""
+    for script in runner.alwayson_scripts:
+        build = getattr(script, "args_from_infotext", None)
+        if build is None:
+            continue
+        try:
+            args = build(params)
+        except Exception as e:
+            print(f"[batch] {script.title()}: couldn't restore its settings from the image: {e!r}")
+            continue
+        if args is not None and len(args) == script.args_to - script.args_from:
+            script_args[script.args_from : script.args_to] = args
+
+
 def apply_source_image_parameters(p, geninfo: str):
     """
     Apply the source image's generation parameters (prompt, seed, sampler, ...)
@@ -491,7 +608,17 @@ def apply_source_image_parameters(p, geninfo: str):
         p.override_settings["CLIP_stop_at_last_layers"] = int(m.group(1))
 
     if params.get("Sampler"):
-        p.sampler_name = params["Sampler"]
+        # An image edited elsewhere (Krita, Comfy) carries that tool's sampler
+        # name — "Alternative - Euler A" and friends aren't Forge samplers, and
+        # sd_samplers.create_sampler() *asserts* on a name it can't resolve, so
+        # passing one straight through would fail the image. Keep Forge's
+        # default instead, and say so.
+        from modules import sd_samplers
+        if sd_samplers.find_sampler_config(params["Sampler"]) is not None:
+            p.sampler_name = params["Sampler"]
+        else:
+            print(f"[batch] Unknown sampler {params['Sampler']!r} in the image's "
+                  f"metadata — using {p.sampler_name!r}.")
     if params.get("Schedule type"):
         p.scheduler = params["Schedule type"]
 
@@ -573,5 +700,8 @@ def request_cancel(stage):
     """Cancel button: abort the image being sampled, then stop the batch."""
     counters = _runs.setdefault(stage.opt_prefix, [0, 0])
     counters[1] = counters[0]
-    shared.state.interrupt()
+    # Only abort the image if it's this tab's: the other tab's batch or a normal
+    # generation may be what's sampling right now. The token still stops our loop.
+    if shared.state.job == stage.opt_prefix:
+        shared.state.interrupt()
     return "⏹️ Cancel requested — finishing the current image, then stopping."

@@ -1,11 +1,13 @@
-// Right-click a thumbnail in the Batch ADetailer source gallery -> select that
-// image and fill Slot 1's ADetailer prompt with the first 3 lines of the image's
-// own prompt (or, if it has none baked in, the live img2img prompt).
+// Right-click a thumbnail in either batch tab's source gallery -> select that
+// image and fill its prompt box with the image's entire prompt (or, if it has
+// none baked in, the live prompt of the tab it came from):
+//   Batch ADetailer  -> Slot 1's ADetailer prompt, falling back to img2img's
+//   Batch Hires-Fix  -> the hires prompt box, falling back to txt2img's
 //
 // Gradio has no contextmenu event, so this is the usual Forge dance: stash the
-// clicked index (and the current img2img prompt, for the fallback) in hidden
-// textboxes, dispatch `input` so gradio's frontend picks the values up, then
-// click a hidden button whose python handler does the work.
+// clicked index (and the live prompt, for the fallback) in hidden textboxes,
+// dispatch `input` so gradio's frontend picks the values up, then click a
+// hidden button whose python handler does the work.
 //
 // Also: ←/→ steps through the thumbnails without clicking each one — it just
 // clicks the neighbour of the selected one, so gradio's own select event does
@@ -13,12 +15,26 @@
 (function () {
     "use strict";
 
-    const INDEX_ID = "batch_adetailer_rclick";
-    const PROMPT_ID = "batch_adetailer_rclick_prompt";
-    const BUTTON_ID = "batch_adetailer_rclick_btn";
-    const GALLERY_ID = "batch_adetailer_source";
+    // One entry per tab: its gallery, its hidden plumbing, and the Forge prompt
+    // box to fall back to. The elem_ids are set in scripts/batch_*.py.
+    const TABS = [
+        {
+            gallery: "batch_adetailer_source",
+            index: "batch_adetailer_rclick",
+            prompt: "batch_adetailer_rclick_prompt",
+            button: "batch_adetailer_rclick_btn",
+            livePrompt: "img2img_prompt",
+        },
+        {
+            gallery: "batch_hires_fix_source",
+            index: "batch_hires_fix_rclick",
+            prompt: "batch_hires_fix_rclick_prompt",
+            button: "batch_hires_fix_rclick_btn",
+            livePrompt: "txt2img_prompt",
+        },
+    ];
 
-    function onRightClick(event) {
+    function onRightClick(tab, event) {
         const gallery = event.currentTarget;
         const thumbs = Array.from(gallery.querySelectorAll(".thumbnail-item"));
         const clicked = event.target.closest(".thumbnail-item");
@@ -30,8 +46,8 @@
         event.preventDefault();
 
         const root = gradioApp();
-        const field = root.querySelector(`#${INDEX_ID} textarea, #${INDEX_ID} input`);
-        const button = root.querySelector(`#${BUTTON_ID}`);
+        const field = root.querySelector(`#${tab.index} textarea, #${tab.index} input`);
+        const button = root.querySelector(`#${tab.button}`);
         if (!field || !button) {
             return;
         }
@@ -39,13 +55,13 @@
         field.value = String(index);
         field.dispatchEvent(new Event("input", { bubbles: true }));
 
-        // Stash the live img2img prompt so python can fall back to it when the
-        // clicked image has no prompt of its own. #img2img_prompt lives on the
-        // img2img tab but stays in the DOM even when that tab isn't showing.
-        const promptField = root.querySelector(`#${PROMPT_ID} textarea, #${PROMPT_ID} input`);
-        const img2imgPrompt = root.querySelector("#img2img_prompt textarea, #img2img_prompt input");
+        // Stash the live prompt so python can fall back to it when the clicked
+        // image has no prompt of its own. #img2img_prompt / #txt2img_prompt live
+        // on their own tabs but stay in the DOM even when those aren't showing.
+        const promptField = root.querySelector(`#${tab.prompt} textarea, #${tab.prompt} input`);
+        const live = root.querySelector(`#${tab.livePrompt} textarea, #${tab.livePrompt} input`);
         if (promptField) {
-            promptField.value = img2imgPrompt ? img2imgPrompt.value : "";
+            promptField.value = live ? live.value : "";
             promptField.dispatchEvent(new Event("input", { bubbles: true }));
         }
 
@@ -67,9 +83,12 @@
             return;
         }
 
-        const gallery = gradioApp().querySelector(`#${GALLERY_ID}`);
-        if (!gallery || gallery.offsetParent === null) {
-            return;  // Batch ADetailer tab isn't on screen
+        // offsetParent picks the one whose tab is actually on screen.
+        const gallery = TABS
+            .map((tab) => gradioApp().querySelector(`#${tab.gallery}`))
+            .find((el) => el && el.offsetParent !== null);
+        if (!gallery) {
+            return;  // neither batch tab is on screen
         }
 
         const thumbs = Array.from(gallery.querySelectorAll(".thumbnail-item"));
@@ -89,20 +108,22 @@
     }
 
     onUiLoaded(function () {
-        // The document survives a Reload UI, the gallery element does not —
+        // The document survives a Reload UI, the gallery elements do not —
         // hence one guard per listener.
         if (!document.body.dataset.badArrowNav) {
             document.body.dataset.badArrowNav = "1";
             document.addEventListener("keydown", onArrowKey);
         }
 
-        const gallery = gradioApp().querySelector(`#${GALLERY_ID}`);
-        if (!gallery || gallery.dataset.badRightClick) {
-            return;
+        for (const tab of TABS) {
+            const gallery = gradioApp().querySelector(`#${tab.gallery}`);
+            if (!gallery || gallery.dataset.badRightClick) {
+                continue;
+            }
+            // Delegated on the gallery itself: the thumbnails are re-rendered on
+            // every drop, the container is not.
+            gallery.dataset.badRightClick = "1";
+            gallery.addEventListener("contextmenu", (event) => onRightClick(tab, event));
         }
-        // Delegated on the gallery itself: the thumbnails are re-rendered on
-        // every drop, the container is not.
-        gallery.dataset.badRightClick = "1";
-        gallery.addEventListener("contextmenu", onRightClick);
     });
 })();

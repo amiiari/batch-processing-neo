@@ -7,7 +7,8 @@ images and refine them one after another:
 - **Batch ADetailer** — runs each image through ADetailer (detect + inpaint
   faces/hands/...) with **per-image** unit settings and prompts.
 - **Batch Hires-Fix** — runs each image through Forge's own hires-fix pipeline,
-  inheriting every image's generation parameters from its metadata.
+  inheriting every image's generation parameters from its metadata, with a
+  **per-image** prompt you can edit before the pass.
 
 ![Forge Neo](https://img.shields.io/badge/Forge-Neo-blue) ![License](https://img.shields.io/badge/license-MIT-green)
 
@@ -16,17 +17,18 @@ images and refine them one after another:
 The tabs are the two stages of one refine chain over work-in-progress folders:
 
 ```
-1r1.png  →  1r1-adetailer.png  →  1r1-adetailer-base.png + 1r1-adetailer-hires.png
- (base)      (Batch ADetailer)                (Batch Hires-Fix)
+1r1.png  →  1r1-hires.png  →  1r1-hires-adetailer.png
+ (base)    (Batch Hires-Fix)       (Batch ADetailer)
 ```
 
 Images are named `<image>r<revision>` (`1r1`, `1r2`, `10r13`); compositional
 edits are new revisions, never suffixes, and only the **latest revision** of
-each image number is picked up. ADetailer runs first — faces are repaired at
-base resolution, where detection pays off — and the low-denoise hires pass
-afterwards re-sharpens its output. The hires stage also saves a plain Lanczos
-`-base` twin at the same resolution: the unedited bottom layer for a layered
-(e.g. Krita) edit stage, so hires drift can be erased away per-region.
+each image number is picked up. Hires-fix runs first, then ADetailer repaints
+the faces on the hires result, so the faces are the last thing touched. A
+layered edit stage (e.g. the content manager's Krita stage) puts the
+`-hires-adetailer` result on top of the `-hires` image, so a face repaint that
+went wrong can be erased per-region. The hires stage can also save a plain
+Lanczos `-base` upscale with no hires pass (off by default).
 
 You don't have to adopt any of this to use the tabs — plain drag-and-drop with
 a custom filename suffix works on any images.
@@ -63,7 +65,12 @@ sampler, ...). You only override the handful of things that vary per image:
 
 - **ADetailer prompt / negative prompt** (empty = reuse that image's own prompt
   from its metadata; `[PROMPT]` — or the friendlier `[base prompt]` — stands
-  for that prompt with room to add to it: `[PROMPT], detailed eyes`)
+  for that prompt with room to add to it: `[PROMPT], detailed eyes`).
+  Prompt editing inherited from the source is collapsed to how the image
+  finished: `[a:b:7]` becomes `b`, `[b:7]` becomes `b`, `[a::7]` becomes
+  nothing (if the image finished after step 7). Schedules typed into the
+  ADetailer prompt run normally, as in regular ADetailer. `[SEP]` separates
+  prompts for successive detections, with each segment keeping its own LoRAs.
 - **Detection confidence**
 - **Inpaint denoising strength**
 - **Mask max area ratio**
@@ -72,8 +79,8 @@ sampler, ...). You only override the handful of things that vary per image:
 put the hand unit in Slot 1 and the face unit in Slot 2, and the face pass runs
 last — over the top of the hand.
 
-**Right-click a thumbnail** to fill Slot 1's prompt with the first 3 lines of
-that image's own prompt (read from its metadata), or the live img2img prompt if
+**Right-click a thumbnail** to fill Slot 1's prompt with that image's entire
+prompt (read from its metadata), or the live img2img prompt if
 the image has none — a quick starting point to edit from.
 
 **▶️ Run this image** re-runs only the selected thumbnail — for when a batch
@@ -117,16 +124,34 @@ process, but with an empty prompt) and set the hires-fix parameters:
 | Resize to Width/Height | exact target size, `0` = use scale factor |
 | Hires sampling method / schedule type | override sampler for the hires pass |
 | Save as original filename + suffix | keep your file names, e.g. `pic.png → pic-hires.png` |
+| Prompt for the hires pass | the selected image's prompt — see per-image prompt editing below |
 
 - **Faithful to the ✨ button** — uses Forge's own hires-fix pipeline
   (`firstpass_image` + `process_images`), not a reimplementation.
+- **Per-image prompt editing** — click a thumbnail and the box below shows the
+  prompt *that image's* hires pass will use, pre-filled from its own metadata.
+  Edit it and only that image changes. Because the tab feeds Forge a
+  `firstpass_image`, the first pass is skipped entirely and this one prompt is
+  what conditions the hires pass. Untouched images run exactly as before.
+  - **Right-click a thumbnail** to select it and refill the box with the
+    image's entire prompt (or the live txt2img prompt if it has none).
+  - **↺ Revert** drops the edit and re-reads the image's own prompt.
+  - **📜 Use the first revision's prompt** reads the prompt out of the same
+    image's earliest revision on disk — select `20r3-adetailer` and it pulls
+    from `20r1` (only the latest revision is ever loaded, so the earlier ones
+    are otherwise out of reach).
+  - **💾 Export / import** writes the edited prompts to a timestamped JSON and
+    merges one back by filename, so they survive a restart.
+  - **📥 Load for editing** in the Test Folders panel loads the same pending
+    images 🚀 Hires-Fix Selected Folders would run, so folder mode gets the
+    editor too instead of going straight to the GPU.
 - **Per-image parameter inheritance** — each image's prompt, negative prompt,
   styles, seed (with variation seed and strength), steps, sampler, scheduler,
   CFG, clip skip, and shift (distilled CFG) are read from its embedded
   generation info, so every image is upscaled exactly the way it was generated.
 - **`-base` Lanczos twin** — optionally saves a plain upscale of the source at
-  the result's exact size (no model pass), the unedited bottom layer for the
-  layered edit stage. On by default, idempotent on re-runs.
+  the result's exact size (no model pass). Off by default, idempotent on
+  re-runs.
 - **Full lightbox preview** — click a result for the full-size viewer with ←/→
   arrow-key navigation, same as the txt2img gallery.
 
@@ -153,6 +178,12 @@ process, but with an empty prompt) and set the hires-fix parameters:
   batch).
 - **Readable errors** — failures show the full traceback in the status log and
   skip to the next image (configurable per tab).
+- **Stagehand images** ([forge-stagehand](../forge-stagehand)) re-run with their characters
+  and references: Character Prompts writes each character as a `Character N:` line in the
+  prompt, which both tabs pass through as the prompt, and scripts that can restore their own
+  settings from an image's metadata (`args_from_infotext`, used by Precise Reference) get them
+  instead of their UI defaults (`replay_script_args`). Batch ADetailer leaves the prompt-editing
+  collapse to Stagehand for those images, so each face gets only its own character.
 
 ### Test-folder mode
 
@@ -171,21 +202,21 @@ work in progress.
 
 The panel is a **to-do list** of pending work:
 
-- On **Batch ADetailer**, a set is listed while it has base images (like
-  `3r1.png`) with no `-adetailer` version next to them. Bases that already have
-  a plain `-hires` sibling went through the old hires-first chain and are left
-  alone.
-- On **Batch Hires-Fix**, a set is listed while it has `-adetailer` images with
-  no `-hires` or `-edited` successor.
+- On **Batch Hires-Fix**, a set is listed while it has base images (like
+  `3r1.png`) with no `-hires` version next to them. Bases that already have a
+  plain `-adetailer` sibling went through the old adetailer-first chain and are
+  left alone.
+- On **Batch ADetailer**, a set is listed while it has `-hires` images with no
+  `-adetailer` or `-edited` successor.
 
 Tick the sets you want and load/run them: every result saves back **next to its
-own source image** with the stage's suffix (`<name>-adetailer.png` /
-`<name>-hires.png`, always png — that naming is what the pending scan keys on,
+own source image** with the stage's suffix (`<name>-hires.png` /
+`<name>-hires-adetailer.png`, always png — that naming is what the pending scan keys on,
 so re-running only ever does new work), and the list rescans itself after each
 batch. A finished set doesn't appear; to load a folder anyway — to redo a set,
 or one that keeps images outside a `Tests` folder — paste its path into the
-**📂 Load Folder** box (re-runs land as `<name>-adetailer-1.png` /
-`<name>-hires-1.png`, originals are never overwritten).
+**📂 Load Folder** box (re-runs land as `<name>-hires-1.png` /
+`<name>-hires-adetailer-1.png`, originals are never overwritten).
 
 ## Settings
 

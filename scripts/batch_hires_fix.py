@@ -7,14 +7,17 @@ the refine chain, after Batch ADetailer — the scan/save plumbing is the shared
 core parameterized with this stage's record.
 """
 import importlib
+import json
 import os
+import re
+import time
 import traceback
 from contextlib import closing
 
 import gradio as gr
 from PIL import Image
 
-from modules import images, processing, script_callbacks, scripts, shared
+from modules import call_queue, images, processing, script_callbacks, scripts, shared
 from modules_forge import main_thread
 
 import batch_adetailer_shared as bshared
@@ -57,17 +60,75 @@ def _register_settings():
 # ──────────────────────────────────────────────
 # Test-folder scanning — shared core, parameterized by this stage's record.
 #
-# Hires-fix picks up -adetailer images that have no -hires successor, and saves
-# two files per image at the same resolution: the hires-fix result
-# (<stem>-hires.png) and a plain Lanczos upscale (<stem>-base.png) as the
-# unedited bottom layer for the Krita edit stage.
+# Hires-fix runs first: it picks up base images (NrM.png) that have no -hires
+# successor and saves the hires-fix result as <stem>-hires.png, which Batch
+# ADetailer then takes. A plain Lanczos upscale (<stem>-base.png) at the same
+# resolution is saved too only when that box is ticked (off by default).
 # ──────────────────────────────────────────────
-def _adetailer_images(folder):
+def _base_images(folder):
     return bshared.stage_inputs(folder, STAGE)
 
 
-def _pending_adetailer(folder):
+def _pending_bases(folder):
     return bshared.pending_inputs(folder, STAGE)
+
+
+# ──────────────────────────────────────────────
+# Per-image prompt overrides
+#
+# The hires pass is conditioned on exactly ONE prompt: firstpass_image skips the
+# first pass entirely (processing.py :: StableDiffusionProcessingTxt2Img.init),
+# and hr_prompt="" makes it fall back to p.prompt. So an override is just "what
+# p.prompt should be for this image".
+#
+# The store is {path: prompt}. A path with no entry runs with the prompt read
+# from its own infotext, exactly as before — so membership, not truthiness,
+# decides: an entry of "" is a real override (hires with no prompt).
+# ──────────────────────────────────────────────
+# `<n>r<rev>` with any pipeline suffix: 20r3, 20r3-adetailer, 20r3-adetailer-base.
+_REVISION_RE = re.compile(r"^(\d+)r(\d+)(?:-.+)?$", re.IGNORECASE)
+
+
+def _prompt_for(store, path):
+    store = store or {}
+    return str(store[path]) if path in store else bshared.image_prompt(path)
+
+
+def _first_revision_prompt(path):
+    """Prompt from the lowest-numbered revision of the same image in the same
+    folder: 20r3-adetailer -> the prompt baked into 20r1 (or, failing a plain
+    20r1, whichever 20r1 variant is on disk). Returns (prompt_or_None, note).
+
+    Only the *latest* revision of each image is ever loaded into this tab, so the
+    earlier ones sit on disk but never in the gallery — hence reading them here.
+    """
+    m = _REVISION_RE.match(os.path.splitext(os.path.basename(path))[0])
+    if not m:
+        return None, "that filename isn't `<number>r<revision>` — no earlier revision to read."
+
+    number = m.group(1)
+    by_rev: dict = {}
+    for stem, fname in bshared.image_stems(os.path.dirname(path)).items():
+        rm = _REVISION_RE.match(stem)
+        # String-compare the number so 020r1 and 20r1 stay different images.
+        if rm and rm.group(1) == number:
+            by_rev.setdefault(int(rm.group(2)), []).append((stem, fname))
+    if not by_rev:
+        return None, "no revisions of that image found next to it."
+
+    rev = min(by_rev)
+    if rev >= int(m.group(2)):
+        return None, f"this already *is* revision {rev}."
+
+    # The plain `<n>r<rev>` base first — it carries the original generation's
+    # infotext; its -adetailer/-hires variants are the fallback.
+    folder = os.path.dirname(path)
+    for stem, fname in sorted(by_rev[rev],
+                              key=lambda sf: ("-" in sf[0], bshared.natural_key(sf[0]))):
+        prompt = bshared.image_prompt(os.path.join(folder, fname))
+        if prompt:
+            return prompt, f"loaded the prompt from `{fname}`."
+    return None, f"revision {number}r{rev} exists, but none of its files carry a prompt."
 
 
 # ──────────────────────────────────────────────
@@ -76,8 +137,8 @@ def _pending_adetailer(folder):
 def _save_base_copy(img: Image.Image, geninfo: str | None, stem: str, outdir: str, size):
     """
     Plain Lanczos upscale of the source at the hires result's exact size,
-    saved as <stem>-base.png next to it — the unedited bottom layer the Krita
-    edit stage puts under the -hires layer. Carries the source's generation
+    saved as <stem>-base.png next to it — the image with no hires pass, for
+    comparing or layering by hand. Carries the source's generation
     info. Skipped if it already exists (re-runs stay idempotent).
     """
     dest = os.path.join(outdir, f"{stem}-base.png")
@@ -93,7 +154,8 @@ def _save_base_copy(img: Image.Image, geninfo: str | None, stem: str, outdir: st
 # ──────────────────────────────────────────────
 # Core Processing Logic — mirrors txt2img_upscale_function
 # ──────────────────────────────────────────────
-def _process_single_image(img: Image.Image, geninfo: str | None, hires_params: dict, save_opts: dict):
+def _process_single_image(img: Image.Image, geninfo: str | None, hires_params: dict,
+                          save_opts: dict, prompt_override: str | None = None):
     """
     Process one image through hires-fix. Mirrors the logic in
     modules/txt2img.py :: txt2img_upscale_function().
@@ -122,8 +184,9 @@ def _process_single_image(img: Image.Image, geninfo: str | None, hires_params: d
             negative_prompt="",
             batch_size=1,
             n_iter=1,
-            cfg_scale=float(hires_params.get("cfg_scale", 7.0)),
-            distilled_cfg_scale=float(hires_params.get("hr_distilled_cfg", 3.0)),
+            # Placeholders: apply_source_image_parameters sets the real ones.
+            cfg_scale=7.0,
+            distilled_cfg_scale=3.0,
             width=img.size[0],
             height=img.size[1],
             enable_hr=True,
@@ -146,7 +209,7 @@ def _process_single_image(img: Image.Image, geninfo: str | None, hires_params: d
             hr_prompt="",
             hr_negative_prompt="",
             hr_cfg=float(hires_params.get("hr_cfg", 6.0)),
-            hr_distilled_cfg=float(hires_params.get("hr_distilled_cfg", 3.0)),
+            hr_distilled_cfg=3.0,  # replaced by the source shift below
             override_settings={},
         )
 
@@ -158,10 +221,19 @@ def _process_single_image(img: Image.Image, geninfo: str | None, hires_params: d
         if geninfo:
             # The ✨ button gets these for free from the live txt2img UI state;
             # we must recover them from the image's infotext.
-            bshared.apply_source_image_parameters(p, geninfo)
+            params = bshared.apply_source_image_parameters(p, geninfo)
+            # Scripts that can rebuild their settings from the image's own (Stagehand's
+            # Precise Reference: its reference images) get them instead of UI defaults.
+            bshared.replay_script_args(scripts.scripts_txt2img, p.script_args, params)
             # Shift-based models (Qwen, Flux, ...): use the same shift for the
             # hires pass as the original generation, like "Use same" semantics.
             p.hr_distilled_cfg = p.distilled_cfg_scale
+
+        if prompt_override is not None:
+            # This image's edited prompt. hr_prompt stays "" so the hires pass
+            # reuses p.prompt; p.styles (recovered from the infotext) are still
+            # folded in on top, exactly as they would be without an override.
+            p.prompt = prompt_override
 
         # An old image's prompt can name a LoRA that no longer exists under
         # that name — the hires pass would silently render without it.
@@ -175,10 +247,6 @@ def _process_single_image(img: Image.Image, geninfo: str | None, hires_params: d
         p.firstpass_image = img
         # Intentionally NOT setting p.txt2img_upscale — see docstring above.
 
-        if shared.opts.txt2img_upscale_single_batch:
-            p.batch_size = 1
-            p.n_iter = 1
-
         p.override_settings["save_images_before_highres_fix"] = False
 
         if save_opts.get("use_original_name"):
@@ -191,7 +259,7 @@ def _process_single_image(img: Image.Image, geninfo: str | None, hires_params: d
             if processed is None:
                 processed = processing.process_images(p)
 
-        if shared.state.interrupted or shared.state.stopping_generation:
+        if shared.state.interrupted or shared.state.stopping_generation or shared.state.skipped:
             # A cancelled sampling loop returns the partially-denoised image;
             # saving it would make the result look finished (and folder mode
             # would then never re-list the base) — drop it instead.
@@ -229,18 +297,22 @@ def batch_hires_fix_process(
     hr_cfg,
     use_original_name,
     filename_suffix,
-    save_base_copy=True,
+    save_base_copy=False,
     save_to_source=False,
+    prompt_store=None,
+    sel=None,
+    live_prompt=None,
 ):
     """
     Main batch processing function. Processes each image through hires-fix
     sequentially and collects all results.
 
     save_base_copy: also save a plain Lanczos upscale of each source as
-    <stem>-base.png at the result's resolution (the unedited bottom layer for
-    the Krita edit stage).
+    <stem>-base.png at the result's resolution (no hires pass; off by default).
     save_to_source: each result is saved into the directory its source image
     came from (folder mode), instead of the configured output directory.
+    prompt_store/sel/live_prompt: the per-image prompt editor's state — see
+    "Per-image prompt overrides" above.
     """
     my_run = bshared.start_run(STAGE)
 
@@ -249,6 +321,13 @@ def batch_hires_fix_process(
         return
 
     skip_errors = shared.opts.batch_hires_fix_skip_errors
+
+    # Snapshot the store: the running generator holds the gr.State by reference,
+    # and a stray edit could otherwise mutate it mid-run. The live box is folded
+    # in because its .input event may not have landed before the Run click did.
+    prompts = dict(prompt_store or {})
+    if sel is not None and 0 <= int(sel) < len(files) and isinstance(files[int(sel)], str):
+        prompts[files[int(sel)]] = live_prompt or ""
 
     hires_params = {
         "denoising_strength": float(denoising_strength),
@@ -284,7 +363,7 @@ def batch_hires_fix_process(
             continue
 
         fname = os.path.basename(image_path)
-        # status lines read "Commission 137 - M, Fluorite/3r1-adetailer.png"
+        # status lines read "Commission 137 - M, Fluorite/3r1.png"
         name = bshared.display_name(image_path) if save_to_source else fname
 
         try:
@@ -297,10 +376,16 @@ def batch_hires_fix_process(
             failed_count += 1
             continue
 
+        # None = no override for this image: it runs with its own baked-in prompt.
+        prompt_override = prompts.get(image_path)
+
         if not geninfo:
             status_messages.append(
                 f"⚠️ [{idx + 1}/{total}] {name}: no generation info found in image — "
-                f"hires pass will run with an empty prompt."
+                + ("your edited prompt still applies, but the image's own sampler, "
+                   "seed and steps are unknown."
+                   if prompt_override is not None else
+                   "hires pass will run with an empty prompt.")
             )
 
         shared.total_tqdm.clear()
@@ -315,7 +400,7 @@ def batch_hires_fix_process(
             # The downstream pipeline (and the pending scan) key on
             # <stem>-hires.png, so the name and format are forced here rather
             # than taken from the suffix box: a custom suffix would leave the
-            # -adetailer image "pending" forever and reprocess it every run.
+            # base image "pending" forever and reprocess it every run.
             # png also keeps the infotext, which jpg/jxl/... silently drop.
             save_opts["use_original_name"] = True
             save_opts["suffix"] = "-hires"
@@ -338,15 +423,22 @@ def batch_hires_fix_process(
         # otherwise stay True forever after a UI reload (request_restart calls
         # interrupt()) and make process_images_inner return 0 images silently.
         # Real generations get this from the UI's wrap_gradio_gpu_call wrapper.
-        shared.state.begin(job="batch_hires_fix")
-        try:
-            # GPU work must run on Forge's main thread, same as the ✨ button
-            # (txt2img.py routes through main_thread.run_and_wait_result).
-            result_images, _infotexts, error_tb, notes = main_thread.run_and_wait_result(
-                _process_single_image, img, geninfo, hires_params, save_opts
-            )
-        finally:
-            shared.state.end()
+        # queue_lock, like wrap_gradio_gpu_call: without it a txt2img/API job and
+        # this image would share shared.state, each begin()/end() clobbering the other.
+        with call_queue.queue_lock:
+            shared.state.begin(job="batch_hires_fix")
+            try:
+                # GPU work must run on Forge's main thread, same as the ✨ button
+                # (txt2img.py routes through main_thread.run_and_wait_result).
+                result_images, _infotexts, error_tb, notes = main_thread.run_and_wait_result(
+                    _process_single_image, img, geninfo, hires_params, save_opts,
+                    prompt_override,
+                )
+            finally:
+                # Read before end() and inside the lock: once released, the next
+                # job's begin() resets these flags.
+                stopped = shared.state.interrupted or shared.state.stopping_generation
+                shared.state.end()
 
         shared.total_tqdm.clear()
 
@@ -362,7 +454,7 @@ def batch_hires_fix_process(
 
         # Cancel/Interrupt pressed during this image: report and stop the batch.
         # (Checked before the next begin(), which would reset shared.state's flags.)
-        if bshared.cancel_requested(STAGE, my_run) or shared.state.interrupted or shared.state.stopping_generation:
+        if bshared.cancel_requested(STAGE, my_run) or stopped:
             status_messages.append(
                 f"⏹️ [{idx + 1}/{total}] Cancelled during {name} — stopping batch."
             )
@@ -399,12 +491,13 @@ def batch_hires_fix_process_folders(
     hr_sampler_name,
     hr_scheduler,
     hr_cfg,
-    save_base_copy=True,
+    save_base_copy=False,
+    prompt_store=None,
 ):
     """
-    Folder mode: hires-fix every pending -adetailer image in the selected
-    Tests folders, saving each result (plus its -base Lanczos twin) back into
-    the folder it came from.
+    Folder mode: hires-fix every pending base image in the selected Tests
+    folders, saving each result (plus its -base Lanczos twin, if ticked) back
+    into the folder it came from.
     """
     if not folders:
         yield [], "No folders selected — tick at least one (🔄 Rescan if the list is stale)."
@@ -412,16 +505,16 @@ def batch_hires_fix_process_folders(
 
     # A ticked set covers its own folder AND its Tests folder.
     files = [f for folder in folders for d in bshared.set_scan_dirs(folder)
-             for f in _pending_adetailer(d)]
+             for f in _pending_bases(d)]
     if not files:
-        yield [], ("Nothing to do — every -adetailer image in the selected sets "
+        yield [], ("Nothing to do — every base image in the selected sets "
                    "already has a -hires (or later) version.")
         return
 
     # Original-name saving AND the "-hires" suffix are forced (the suffix
     # textbox is ignored here): <stem>-hires.png next to its source is what the
     # pending-scan and the content manager key on — a custom suffix would
-    # leave -adetailer images "pending" forever and reprocess them every run.
+    # leave base images "pending" forever and reprocess them every run.
     yield from batch_hires_fix_process(
         files,
         denoising_strength,
@@ -437,17 +530,45 @@ def batch_hires_fix_process_folders(
         "-hires",
         save_base_copy=save_base_copy,
         save_to_source=True,
+        # Edits made after a "📥 Load for editing" still apply if the same
+        # images are run from the folder button (both key on the real path).
+        prompt_store=prompt_store,
     )
 
 
 # ──────────────────────────────────────────────
 # Gradio UI Tab
 # ──────────────────────────────────────────────
-def _on_files(files, suffix_filter):
+def _editing_label(paths, sel):
+    if not paths:
+        return "*No images loaded — drop images or load a folder to edit prompts.*"
+    if sel is None or not (0 <= int(sel) < len(paths)):
+        return "*Click a thumbnail to edit the prompt its hires pass will use.*"
+    return (f"**Editing:** `{os.path.basename(paths[int(sel)])}`"
+            f"  ({int(sel) + 1}/{len(paths)})")
+
+
+# Every loader returns this same batch of updates:
+# [source_gallery, paths_state, sel_state, editing_md, prompt_box, preview_img].
+_EDITOR_OUTPUTS = 6
+
+
+def _editor_updates(paths, store):
+    """A freshly loaded image list, with the first image selected and the prompt
+    its hires pass would use in the editor."""
+    if not paths:
+        return [gr.update(value=None), [], None, _editing_label([], None),
+                gr.update(value=""), gr.update(value=None)]
+    return [gr.update(value=paths, selected_index=0), paths, 0,
+            _editing_label(paths, 0), gr.update(value=_prompt_for(store, paths[0])),
+            gr.update(value=paths[0])]
+
+
+def _on_files(files, suffix_filter, store):
     """Files dropped/browsed: keep only those whose stem ends with the suffix
     filter (blank = keep everything), trade gradio's temp copies for the on-disk
-    originals, and preview the survivors. Returns updates for
-    [source_gallery, paths_state, file_input, status_text]."""
+    originals, and load the survivors into the editor. Returns
+    [*_EDITOR_OUTPUTS, file_input, status_text]."""
     paths = bshared.file_paths(files)
     paths, skipped = bshared.filter_suffix(paths, suffix_filter)
 
@@ -467,30 +588,182 @@ def _on_files(files, suffix_filter):
         note = (f" Skipped {skipped} not ending in `{(suffix_filter or '').strip()}`."
                 if skipped else "")
         status = " ".join([f"Loaded {len(paths)} image(s)." + note, *notes])
-    return gr.update(value=paths or None), paths, file_update, status
+    return [*_editor_updates(paths, store), file_update, status]
 
 
 def _folder_choices():
     return bshared.folder_choices(STAGE)
 
 
-def _load_folder_path(path):
-    """📂 Load Folder: every -adetailer image in one folder, done or not, loaded
+def _load_folder_path(path, store):
+    """📂 Load Folder: every base image in one folder, done or not, loaded
     with its real path so save-to-source lands results back in it. Bypasses the
     Test Folders panel, which is a to-do list and so can't show a finished set —
     or a set that keeps its images outside a Tests folder at all.
-    Returns updates for [source_gallery, paths_state, save_to_source, status_text]."""
+    Returns [*_EDITOR_OUTPUTS, save_to_source, status_text]."""
     folder = (path or "").strip().strip('"')
-    files = _adetailer_images(folder) if folder else []
+    files = _base_images(folder) if folder else []
     if not files:
-        return gr.update(), gr.update(), gr.update(), (
-            "No -adetailer images in that folder — check the path. "
-            "(This stage's inputs are <name>-adetailer.png files.)"
-        )
-    return gr.update(value=files), files, gr.update(value=True), (
+        return [*([gr.update()] * _EDITOR_OUTPUTS), gr.update(), (
+            "No base images in that folder — check the path. "
+            "(This stage's inputs are plain <name>.png files; -hires / -adetailer / "
+            "-edited / -base files aren't bases.)"
+        )]
+    return [*_editor_updates(files, store), gr.update(value=True), (
         f"Loaded {len(files)} image(s) from {folder} — results save back into it as "
         f"<name>-hires.png. 🚀 Run Batch Hires-Fix when ready."
+    )]
+
+
+def _load_pending_folders(folders, store):
+    """📥 Load for editing: the same pending images 🚀 Hires-Fix Selected
+    Folders would run, loaded into the gallery instead — so their prompts can be
+    edited first. Ticks save-to-source, since these paths are the real ones.
+    Returns [*_EDITOR_OUTPUTS, save_to_source, status_text]."""
+    files = [f for folder in (folders or []) if folder
+             for d in bshared.set_scan_dirs(folder) for f in _pending_bases(d)]
+    if not files:
+        return [*([gr.update()] * _EDITOR_OUTPUTS), gr.update(), (
+            "Nothing to load — tick at least one set with pending base "
+            "images (🔄 Rescan if the list is stale)."
+        )]
+    return [*_editor_updates(files, store), gr.update(value=True), (
+        f"Loaded {len(files)} pending image(s) — click a thumbnail to edit the "
+        f"prompt its hires pass will use, then 🚀 Run Batch Hires-Fix."
+    )]
+
+
+# ──────────────────────────────────────────────
+# Prompt editor handlers
+# ──────────────────────────────────────────────
+def _on_select_image(store, paths, evt: gr.SelectData):
+    """Thumbnail clicked: show that image and the prompt its hires pass will use.
+    sel_state is returned in the SAME outputs batch as the box, so nothing can
+    write the newly loaded prompt back into the previously selected image."""
+    idx = int(evt.index)
+    paths = list(paths or [])
+    if not (0 <= idx < len(paths)):
+        return [gr.update()] * 4
+    return [idx, _editing_label(paths, idx),
+            gr.update(value=_prompt_for(store, paths[idx])),
+            gr.update(value=paths[idx])]
+
+
+def _on_right_click(store, paths, index, txt2img_prompt=""):
+    """Thumbnail right-clicked (javascript/batch_adetailer.js puts the index in a
+    hidden textbox and clicks a hidden button — gradio has no contextmenu event):
+    select that image and fill the box with its entire baked-in prompt, falling
+    back to the live txt2img prompt (stashed by the JS) when the image has none.
+    Same as the ADetailer tab's right-click. With neither, the box is left as is.
+    Returns [sel_state, editing_md, prompt_box, preview_img, prompt_store]."""
+    paths = list(paths or [])
+    try:
+        idx = int(index)
+    except (TypeError, ValueError):
+        idx = -1
+    if not (0 <= idx < len(paths)):
+        return [*([gr.update()] * 4), store]
+
+    store = dict(store or {})
+    path = paths[idx]
+    prompt = bshared.image_prompt(path) or (txt2img_prompt or "").strip()
+    if prompt:
+        store[path] = prompt
+    return [idx, _editing_label(paths, idx),
+            gr.update(value=_prompt_for(store, path)),
+            gr.update(value=path), store]
+
+
+def _on_prompt_edit(store, paths, sel, prompt):
+    """Prompt box typed in: persist it against the selected image. Bound to
+    .input, not .change — a programmatic reload of the box must never be written
+    back as if it were an edit."""
+    if sel is None or not paths or not (0 <= int(sel) < len(paths)):
+        return store
+    store = dict(store or {})
+    store[paths[int(sel)]] = prompt or ""
+    return store
+
+
+def _on_revert(store, paths, sel):
+    """↺ drop this image's override and re-read its own baked-in prompt."""
+    if sel is None or not paths or not (0 <= int(sel) < len(paths)):
+        return store, gr.update(), "Click a thumbnail first."
+    path = paths[int(sel)]
+    store = dict(store or {})
+    store.pop(path, None)
+    return store, gr.update(value=bshared.image_prompt(path)), (
+        f"↺ `{os.path.basename(path)}` reset to the prompt baked into the image."
     )
+
+
+def _on_first_revision(store, paths, sel):
+    """📜 fill the box with the prompt from this image's first revision."""
+    if sel is None or not paths or not (0 <= int(sel) < len(paths)):
+        return store, gr.update(), "Click a thumbnail first."
+    path = paths[int(sel)]
+    prompt, note = _first_revision_prompt(path)
+    if prompt is None:
+        return store, gr.update(), f"⚠️ {os.path.basename(path)}: {note}"
+    store = dict(store or {})
+    store[path] = prompt
+    return store, gr.update(value=prompt), f"📜 {os.path.basename(path)}: {note}"
+
+
+def _export_prompts(store, paths, folder):
+    """Snapshot the edited prompts (keyed by <set>/<file>) into a timestamped JSON,
+    so they survive a restart."""
+    if not paths:
+        return "Nothing to export — load images first."
+    folder = (folder or "").strip().strip('"')
+    if not folder:
+        return "Set an export folder first."
+    data = {bshared.export_key(p): (store or {})[p] for p in paths if p in (store or {})}
+    if not data:
+        return "Nothing to export — no edited prompts yet."
+    os.makedirs(folder, exist_ok=True)
+    out = os.path.join(folder, time.strftime("batch_hires_fix_prompts_%Y%m%d_%H%M%S.json"))
+    with open(out, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+    return f"💾 Exported {len(data)} prompt(s) → {out}"
+
+
+def _import_prompts(file, store, paths, sel):
+    """Merge an exported JSON back onto the loaded images, matched by <set>/<file>, else
+    a unique filename (full paths differ between sessions — moved folders, gradio temp copies).
+    Returns [store, prompt_box, status_text]."""
+    path = file if isinstance(file, str) else getattr(file, "name", None)
+    if not path:
+        return store, gr.update(), gr.update()
+    try:
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f)
+        if not isinstance(data, dict):
+            raise ValueError("not a Batch Hires-Fix prompt export")
+    except Exception as e:
+        return store, gr.update(), f"⚠️ Couldn't read that export: {e}"
+
+    if not paths:
+        return store, gr.update(), (
+            "⚠️ Load your images first, then import — entries are matched by filename."
+        )
+
+    store = dict(store or {})
+    matched = 0
+    for p in paths:
+        prompt = bshared.lookup_export(data, p)
+        if isinstance(prompt, str):
+            store[p] = prompt
+            matched += 1
+
+    box = gr.update()
+    if sel is not None and 0 <= int(sel) < len(paths) and paths[int(sel)] in store:
+        box = gr.update(value=store[paths[int(sel)]])
+
+    msg = f"📥 Imported prompts for {matched} of {len(paths)} loaded image(s)."
+    if matched < len(data):
+        msg += f" ({len(data) - matched} entries in the file had no matching image.)"
+    return store, box, msg
 
 
 def _build_ui_tab():
@@ -505,12 +778,83 @@ def _build_ui_tab():
     with gr.Blocks(analytics_enabled=False) as block:
         gr.Markdown(
             "# Batch Hires-Fix\n"
-            "Drag and drop images generated via txt2img to run them through hires-fix in batch."
+            "Drag and drop images generated via txt2img to run them through hires-fix in batch.\n\n"
+            "*Click a thumbnail on the right to edit the prompt **that image's** hires pass "
+            "will use — right-click one to refill the box with its entire prompt — "
+            "it starts as the prompt baked into the image. \u2190/\u2192 steps through the "
+            "thumbnails (when you're not typing in a box).*"
+        )
+
+        gr.HTML(
+            """
+            <style>
+            /* Same treatment as the ADetailer tab: drag the bottom-right corner
+               to see more than one row of thumbnails. Gradio has no resizable
+               gallery, but the block is just a div — `resize` is all it takes.
+               The block is a flex column so the thumbnail grid *follows* the
+               dragged height instead of stopping at its own max-height. */
+            #batch_hires_fix_source {
+                height: 200px;
+                min-height: 140px;
+                resize: vertical;
+                overflow: hidden;
+                display: flex;
+                flex-direction: column;
+            }
+            #batch_hires_fix_source .grid-wrap,
+            #batch_hires_fix_source .grid-container,
+            #batch_hires_fix_source .gallery-container {
+                flex: 1 1 auto;
+                height: auto !important;
+                max-height: none !important;
+                min-height: 0 !important;
+                overflow-y: auto;
+            }
+            /* The drop zone's file list grows with every image dropped. */
+            #batch_hires_fix_files { max-height: 220px; overflow-y: auto; }
+            /* The preview: the WHOLE image is always visible, scaled to fit the
+               box, however small the box is dragged. The container is pinned to
+               the box's bounds (absolute inset) so no intermediate wrapper can
+               size itself to the image's natural height and crop it against
+               overflow:hidden. */
+            #batch_hires_fix_preview {
+                height: 400px;
+                min-height: 160px;
+                resize: vertical;
+                overflow: hidden;
+                position: relative;
+            }
+            #batch_hires_fix_preview .image-container {
+                position: absolute;
+                inset: 0;
+                height: auto !important;
+            }
+            #batch_hires_fix_preview .image-container button,
+            #batch_hires_fix_preview .image-container img {
+                width: 100%;
+                height: 100%;
+                max-height: none !important;
+                object-fit: contain;
+            }
+            </style>
+            """
         )
 
         # The run reads this, not the drop zone: dropped paths are gradio's temp
         # copies, and the originals must not round-trip back through gr.File.
         paths_state = gr.State([])
+
+        # Per-image prompt overrides, {path: prompt}. An image with no entry runs
+        # with the prompt read from its own infotext, as it always did.
+        prompt_store = gr.State({})
+        sel_state = gr.State(None)
+
+        # Driven from javascript/batch_adetailer.js on right-click: gradio has no
+        # contextmenu event, so the JS writes the thumbnail index (and the live
+        # txt2img prompt, for the fallback) here and clicks the button.
+        rclick_index = gr.Textbox(visible=False, elem_id="batch_hires_fix_rclick")
+        rclick_prompt = gr.Textbox(visible=False, elem_id="batch_hires_fix_rclick_prompt")
+        rclick_btn = gr.Button(visible=False, elem_id="batch_hires_fix_rclick_btn")
 
         # Test Folders panel spans the full width at the top, like the ADetailer tab.
         with gr.Accordion("📁 Test Folders — hires-fix in place", open=True):
@@ -519,6 +863,9 @@ def _build_ui_tab():
                 folder_btn = gr.Button(
                     "🚀 Hires-Fix Selected Folders", variant="primary", scale=3
                 )
+                # The button above goes straight from scan to GPU; this one stops
+                # at the gallery so the prompts can be edited first.
+                load_folders_btn = gr.Button("📥 Load for editing", scale=2)
                 refresh_btn = gr.Button("🔄 Rescan", scale=1)
 
             # The panel above is a to-do list, so a finished set is invisible and
@@ -526,7 +873,7 @@ def _build_ui_tab():
             # all. This loads any folder as-is, done or not.
             with gr.Row():
                 folder_path = gr.Textbox(
-                    label="…or load every -adetailer image in one folder, done or not",
+                    label="…or load every base image in one folder, done or not",
                     placeholder=r"C:\art\Commission 12 - Example",
                     max_lines=1,
                     scale=4,
@@ -538,6 +885,7 @@ def _build_ui_tab():
         with gr.Row():
             file_input = gr.File(
                 label="Drop images here (or click to browse)",
+                elem_id="batch_hires_fix_files",
                 file_count="multiple",
                 file_types=["image"],
                 type="filepath",
@@ -552,9 +900,57 @@ def _build_ui_tab():
                 scale=1,
             )
 
+        with gr.Accordion("💾 Export / import per-image prompts", open=False):
+            with gr.Row():
+                export_dir = gr.Textbox(
+                    value="",
+                    label="Export folder",
+                    placeholder=r"C:\art\prompt exports",
+                    max_lines=1,
+                    scale=3,
+                )
+                export_btn = gr.Button("💾 Export prompts", scale=1)
+                import_file = gr.File(
+                    label="Import — drop an exported .json here (after loading the images)",
+                    file_types=[".json"],
+                    type="filepath",
+                    scale=2,
+                )
+
         with gr.Row():
-            # ── Left column: hires-fix controls ──
+            # ── Left column: the per-image prompt editor, then the settings ──
+            # Same running order as the ADetailer tab: the image being edited
+            # sits at the top, whole and scaled to fit — it doesn't need to be
+            # big, it needs to show what's being configured. No `height`: the
+            # CSS above sizes the box and gives it a drag handle.
             with gr.Column(scale=1):
+                preview_img = gr.Image(
+                    label="Selected image",
+                    elem_id="batch_hires_fix_preview",
+                    interactive=False,
+                    show_download_button=False,
+                )
+
+                editing_md = gr.Markdown(_editing_label([], None))
+
+                # The elem_id deliberately carries the real ADetailer's txt2img
+                # prefix: tag autocomplete (sd-webui-tagcomplete) finds its
+                # third-party targets via
+                # `[id^=script_txt2img_adetailer_ad_prompt] textarea`, so
+                # matching the prefix gets autocomplete in this box with no
+                # tagcomplete configuration.
+                prompt_box = gr.Textbox(
+                    label="Prompt for the hires pass",
+                    elem_id="script_txt2img_adetailer_ad_prompt_batch_hires",
+                    placeholder="Click a thumbnail on the right to load its prompt.",
+                    lines=8,
+                    max_lines=24,
+                )
+
+                with gr.Row():
+                    revert_btn = gr.Button("↺ Revert to the image's own prompt", scale=1)
+                    first_rev_btn = gr.Button("📜 Use the first revision's prompt", scale=1)
+
                 gr.Markdown("### Hires-Fix Settings")
 
                 with gr.Row():
@@ -626,9 +1022,9 @@ def _build_ui_tab():
                     )
 
                 save_base_copy = gr.Checkbox(
-                    value=True,
-                    label="Also save a plain Lanczos upscale (<name>-base.png, same size "
-                          "as the result — the unedited layer for the Krita edit stage)",
+                    value=False,
+                    label="Also save a plain Lanczos upscale with no hires pass "
+                          "(<name>-base.png, same size as the result)",
                 )
 
                 # Ticked automatically by "📂 Load Folder". Forces <name>-hires.png,
@@ -646,13 +1042,21 @@ def _build_ui_tab():
 
             # ── Right column: output & status ──
             with gr.Column(scale=2):
-                # Mirrors the adetailer tab: a preview of the images the run will
-                # actually process, so the suffix filter's effect is visible.
+                # The images the run will actually process (so the suffix
+                # filter's effect is visible) and the prompt editor's selector.
+                # No `height`: the CSS above gives the block a starting height
+                # and a drag handle, and the thumbnails scroll inside it.
+                # allow_preview=False keeps a click a *selection* instead of
+                # popping open the full-size viewer.
                 source_gallery = gr.Gallery(
-                    label="Loaded images (what will be processed)",
+                    label="Loaded images — click one to edit the prompt its hires pass will use, "
+                          "right-click to refill it with the image's entire prompt",
+                    elem_id="batch_hires_fix_source",
                     columns=[4],
-                    height=200,
                     preview=False,
+                    allow_preview=False,
+                    show_download_button=False,
+                    interactive=False,
                 )
 
                 # elem_id must end in "_gallery" so Forge's lightbox modal
@@ -680,10 +1084,22 @@ def _build_ui_tab():
             queue=False,
         )
 
+        # Every loader writes the same batch: the gallery, the paths the run
+        # reads, the selection, and the editor showing the first image.
+        editor_outputs = [source_gallery, paths_state, sel_state, editing_md,
+                          prompt_box, preview_img]
+
         load_path_btn.click(
             fn=_load_folder_path,
-            inputs=[folder_path],
-            outputs=[source_gallery, paths_state, save_to_source, status_text],
+            inputs=[folder_path, prompt_store],
+            outputs=[*editor_outputs, save_to_source, status_text],
+            queue=False,
+        )
+
+        load_folders_btn.click(
+            fn=_load_pending_folders,
+            inputs=[folder_select, prompt_store],
+            outputs=[*editor_outputs, save_to_source, status_text],
             queue=False,
         )
 
@@ -701,6 +1117,7 @@ def _build_ui_tab():
                 hr_scheduler,
                 hr_cfg,
                 save_base_copy,
+                prompt_store,
             ],
             outputs=[output_gallery, status_text],
         ).then(  # the run consumed pending work — rescan so the list stays honest
@@ -723,8 +1140,63 @@ def _build_ui_tab():
         # like adetailer, it only re-filters when the file list itself changes.
         file_input.change(
             fn=_on_files,
-            inputs=[file_input, suffix_filter],
-            outputs=[source_gallery, paths_state, file_input, status_text],
+            inputs=[file_input, suffix_filter, prompt_store],
+            outputs=[*editor_outputs, file_input, status_text],
+            queue=False,
+        )
+
+        # ── prompt editor ──
+        source_gallery.select(
+            fn=_on_select_image,
+            inputs=[prompt_store, paths_state],
+            outputs=[sel_state, editing_md, prompt_box, preview_img],
+            queue=False,
+        )
+
+        rclick_btn.click(
+            fn=_on_right_click,
+            inputs=[prompt_store, paths_state, rclick_index, rclick_prompt],
+            outputs=[sel_state, editing_md, prompt_box, preview_img, prompt_store],
+            queue=False,
+            show_progress="hidden",
+        )
+
+        # .input, not .change: only a keystroke is an edit. A .change would also
+        # fire when a *selection* rewrites the box, writing the newly loaded
+        # prompt back into whichever image was selected a moment ago.
+        prompt_box.input(
+            fn=_on_prompt_edit,
+            inputs=[prompt_store, paths_state, sel_state, prompt_box],
+            outputs=[prompt_store],
+            queue=False,
+            show_progress="hidden",
+        )
+
+        revert_btn.click(
+            fn=_on_revert,
+            inputs=[prompt_store, paths_state, sel_state],
+            outputs=[prompt_store, prompt_box, status_text],
+            queue=False,
+        )
+
+        first_rev_btn.click(
+            fn=_on_first_revision,
+            inputs=[prompt_store, paths_state, sel_state],
+            outputs=[prompt_store, prompt_box, status_text],
+            queue=False,
+        )
+
+        export_btn.click(
+            fn=_export_prompts,
+            inputs=[prompt_store, paths_state, export_dir],
+            outputs=[status_text],
+            queue=False,
+        )
+
+        import_file.change(
+            fn=_import_prompts,
+            inputs=[import_file, prompt_store, paths_state, sel_state],
+            outputs=[prompt_store, prompt_box, status_text],
             queue=False,
         )
 
@@ -745,6 +1217,9 @@ def _build_ui_tab():
                 filename_suffix,
                 save_base_copy,
                 save_to_source,
+                prompt_store,
+                sel_state,
+                prompt_box,
             ],
             outputs=[output_gallery, status_text],
         ).then(  # a save-to-source run consumed pending work — keep the list honest
