@@ -539,8 +539,10 @@ def image_prompt(path):
 
 
 # forge-stagehand's Character Prompts writes each character as a line under the main prompt
-# ("Character 2 (Lan): girl, ..."); see its lib_stagehand/characters.py.
-_CHARACTER_LINE_RE = re.compile(r"^Character \d+(?: \(.*?\))?(?: at (?:(?:[\d.]+ ){3}[\d.]+|[A-E][1-5]))?:", re.M)
+# ("Character 2 (Lan): girl, ..."); see its lib_stagehand/characters.py (_LABEL). The place
+# is matched loosely: several places joined by " + " and a ", share N%" can follow it, and a
+# line this missed was inpainted as a plain prompt (pure-noise faces).
+_CHARACTER_LINE_RE = re.compile(r"^Character \d+(?: \(.*?\))?(?: at [^:\n]+)?(?:, share \d{1,3}%)?:", re.M)
 
 
 def has_characters(prompt: str) -> bool:

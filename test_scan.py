@@ -345,6 +345,10 @@ else:
     assert bshared.has_characters("masterpiece, 2girls\n\nCharacter 1 (Ruby): girl\nCharacter 2 at 0.500 0 1 1: girl")
     assert bshared.has_characters("Character 3: girl")
     assert bshared.has_characters("base\n\nCharacter 1 (Ruby) at B2: girl")  # a grid cell
+    # several places and an overlap share -- missing these gave C02 noise faces
+    assert bshared.has_characters("Character 1 (kira) at 0.503 0.000 1.000 1.000 + 0.318 0.000 0.512 0.663: girl")
+    assert bshared.has_characters("Character 2 (annie) at 0.000 0.233 0.324 1.000 + 0.327 0.650 1.000 1.000, share 70%: girl")
+    assert bshared.has_characters("Character 2, share 30%: girl")
     assert not bshared.has_characters("a Character study\nCharacter design, 1girl")
     assert not bshared.has_characters("")
 
