@@ -1,4 +1,4 @@
-# Batch ADetailer + Batch Hires-Fix for Forge Neo
+# Batch Processing for Forge Neo (Batch ADetailer + Batch Hires-Fix)
 
 Two batch-processing tabs for [Stable Diffusion WebUI Forge — Neo](https://github.com/Haoming02/sd-webui-forge-classic/tree/neo),
 built around one shared core. Drop in (or auto-discover) a folder's worth of
@@ -46,7 +46,7 @@ without it. No extra pip dependencies.
 1. Clone this repository into your Forge Neo `extensions` folder:
    ```
    cd <your Forge Neo folder>/extensions
-   git clone https://github.com/amiiari/batch-adetailer-neo
+   git clone https://github.com/amiiari/batch-processing-neo
    ```
 2. Restart Forge Neo (or Reload UI).
 3. Two new tabs appear: **Batch ADetailer** and **Batch Hires-Fix**.
