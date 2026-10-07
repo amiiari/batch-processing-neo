@@ -1030,7 +1030,7 @@ def _build_ui_tab():
                 # Ticked automatically by "📂 Load Folder". Forces <name>-hires.png,
                 # so the suffix box above is ignored while this is on.
                 save_to_source = gr.Checkbox(
-                    value=False,
+                    value=True,
                     label="Save as <name>-hires.png into each image's own folder",
                 )
 

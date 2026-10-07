@@ -1332,7 +1332,7 @@ def _build_ui_tab():
 
                 # Ticked automatically by "Load Selected Folders".
                 save_to_source = gr.Checkbox(
-                    value=False,
+                    value=True,
                     label="Save as <name>-adetailer.png into each image's own folder",
                 )
 
