@@ -424,7 +424,8 @@ def _collapse_prompt_editing(unit_dicts, p):
 # ──────────────────────────────────────────────
 # Core Processing Logic
 # ──────────────────────────────────────────────
-def _process_single_image(img: Image.Image, geninfo: str | None, unit_dicts: list, save_opts: dict):
+def _process_single_image(img: Image.Image, geninfo: str | None, unit_dicts: list, save_opts: dict,
+                          char_edits: list | None = None):
     """
     Run one image through ADetailer.
 
@@ -503,6 +504,8 @@ def _process_single_image(img: Image.Image, geninfo: str | None, unit_dicts: lis
             p.negative_prompt = shared.prompt_styles.apply_negative_styles_to_prompt(
                 p.negative_prompt, p.styles)
             p.styles = []
+            # Stagehand: each character's box rewrites her line, which her face then gets
+            p.prompt = bshared.apply_character_edits(p.prompt, char_edits)
 
         # A slot with a blank ADetailer prompt inpaints with *this* prompt (ADetailer
         # falls back to p.all_prompts), so a LoRA that can't be resolved here is a
@@ -581,7 +584,8 @@ def _process_single_image(img: Image.Image, geninfo: str | None, unit_dicts: lis
         return [], [], tb, notes
 
 
-def batch_adetailer_run_selected(store, paths, sel, use_original_name, filename_suffix, save_to_source, *control_values):
+def batch_adetailer_run_selected(store, paths, sel, use_original_name, filename_suffix, save_to_source, char_store,
+                                 *control_values):
     """
     Re-run just the selected image — for when a batch came out fine except for one
     or two. It's the batch loop over a single path, so the config, saving and
@@ -594,11 +598,12 @@ def batch_adetailer_run_selected(store, paths, sel, use_original_name, filename_
         return
 
     yield from batch_adetailer_process(
-        store, [paths[int(sel)]], 0, use_original_name, filename_suffix, save_to_source, *control_values
+        store, [paths[int(sel)]], 0, use_original_name, filename_suffix, save_to_source, char_store, *control_values
     )
 
 
-def batch_adetailer_process(store, paths, sel, use_original_name, filename_suffix, save_to_source, *control_values):
+def batch_adetailer_process(store, paths, sel, use_original_name, filename_suffix, save_to_source, char_store,
+                            *control_values):
     """
     Main batch processing function. Each image is processed with its own config
     from the store, sequentially.
@@ -635,6 +640,7 @@ def batch_adetailer_process(store, paths, sel, use_original_name, filename_suffi
     store = _copy.deepcopy(dict(store or {}))
     if sel is not None and 0 <= int(sel) < len(paths):
         store[paths[int(sel)]] = list(control_values)
+    char_store = _copy.deepcopy(dict(char_store or {}))
 
     defaults = _get_adetailer_defaults()
     if not defaults:
@@ -734,7 +740,7 @@ def batch_adetailer_process(store, paths, sel, use_original_name, filename_suffi
                 # GPU work must run on Forge's main thread, same as img2img()
                 # (img2img.py routes through main_thread.run_and_wait_result).
                 result_images, _infotexts, error_tb, notes = main_thread.run_and_wait_result(
-                    _process_single_image, img, geninfo, unit_dicts, save_opts
+                    _process_single_image, img, geninfo, unit_dicts, save_opts, char_store.get(image_path)
                 )
             finally:
                 # Read before end() and inside the lock: once released, the next
@@ -1225,6 +1231,8 @@ def _build_ui_tab():
         paths_state = gr.State([])
         store_state = gr.State({})
         sel_state = gr.State(None)
+        # {path: [one per Stagehand character]}: kept apart from the slot configs
+        char_state = gr.State({})
 
         # Driven from javascript/batch_adetailer.js on right-click: gradio has no
         # contextmenu event, so the JS writes the thumbnail index here and clicks
@@ -1309,6 +1317,9 @@ def _build_ui_tab():
                         with gr.Tab(f"Slot {i + 1}"):
                             slot_controls.append(_slot_controls(i, num_slots))
 
+                # Stagehand images: a face prompt per character, shown for the ones in the image
+                char_boxes = bshared.character_boxes("script_img2img_adetailer_ad_prompt_batch_char", "face prompt")
+
                 controls = [c for slot in slot_controls for c in slot]
                 presets = [slot[0] for slot in slot_controls]
                 overrides = [c for slot in slot_controls for c in slot[1:]]
@@ -1386,25 +1397,61 @@ def _build_ui_tab():
         def on_right_click(store, paths, index, img2img_prompt):
             return _on_right_click(store, paths, index, num_slots, img2img_prompt)
 
+        # the character boxes follow the selected image (after each handler that changes it)
+        def chars_refresh(chars, paths, sel):
+            path = paths[int(sel)] if paths and sel is not None and 0 <= int(sel) < len(paths) else None
+            prompt = bshared.image_prompt(path) if path else ""
+            return bshared.character_box_updates(prompt, (chars or {}).get(path), "face prompt")
+
+        def chars_expand(chars, paths, sel):
+            """Right-click: every character's box written out from the image's prompt."""
+            if not paths or sel is None or not 0 <= int(sel) < len(paths):
+                return chars
+            prompt = bshared.image_prompt(paths[int(sel)])
+            if not bshared.image_characters(prompt):
+                return chars
+            return {**(chars or {}), paths[int(sel)]: bshared.expanded_characters(prompt)}
+
+        def chars_edit(chars, paths, sel, *boxes):
+            if not paths or sel is None or not 0 <= int(sel) < len(paths):
+                return chars
+            return {**(chars or {}), paths[int(sel)]: list(boxes)}
+
+        refresh = dict(fn=chars_refresh, inputs=[char_state, paths_state, sel_state], outputs=char_boxes,
+                       queue=False, show_progress="hidden")
+
         file_input.change(
             fn=on_files,
             inputs=[file_input, store_state, suffix_filter],
             outputs=[source_gallery, paths_state, store_state, sel_state, editing_md,
                      *controls, file_input, preview_img],
             queue=False,
-        )
+        ).then(**refresh)
 
         source_gallery.select(
             fn=on_select_image,
             inputs=[store_state, paths_state],
             outputs=[sel_state, editing_md, *controls, preview_img],
             queue=False,
-        )
+        ).then(**refresh)
 
         rclick_btn.click(
             fn=on_right_click,
             inputs=[store_state, paths_state, rclick_index, rclick_prompt],
             outputs=[sel_state, editing_md, *controls, preview_img, store_state],
+            queue=False,
+            show_progress="hidden",
+        ).then(
+            fn=chars_expand, inputs=[char_state, paths_state, sel_state], outputs=char_state,
+            queue=False, show_progress="hidden",
+        ).then(**refresh)
+
+        # .input: a keystroke is an edit; a refresh setting the boxes is not
+        gr.on(
+            triggers=[b.input for b in char_boxes],
+            fn=chars_edit,
+            inputs=[char_state, paths_state, sel_state, *char_boxes],
+            outputs=char_state,
             queue=False,
             show_progress="hidden",
         )
@@ -1485,7 +1532,7 @@ def _build_ui_tab():
             inputs=[folder_select, store_state],
             outputs=folder_outputs,
             queue=False,
-        )
+        ).then(**refresh)
 
         load_path_btn.click(
             fn=lambda path, store: _load_folders(
@@ -1496,7 +1543,7 @@ def _build_ui_tab():
             inputs=[folder_path, store_state],
             outputs=folder_outputs,
             queue=False,
-        )
+        ).then(**refresh)
 
         rescan_btn.click(
             fn=_folder_choices,
@@ -1516,7 +1563,7 @@ def _build_ui_tab():
 
         run_inputs = [
             store_state, paths_state, sel_state,
-            use_original_name, filename_suffix, save_to_source,
+            use_original_name, filename_suffix, save_to_source, char_state,
             *controls,
         ]
 

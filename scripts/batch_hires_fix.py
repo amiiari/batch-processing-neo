@@ -302,6 +302,7 @@ def batch_hires_fix_process(
     prompt_store=None,
     sel=None,
     live_prompt=None,
+    char_store=None,
 ):
     """
     Main batch processing function. Processes each image through hires-fix
@@ -328,6 +329,12 @@ def batch_hires_fix_process(
     prompts = dict(prompt_store or {})
     if sel is not None and 0 <= int(sel) < len(files) and isinstance(files[int(sel)], str):
         prompts[files[int(sel)]] = live_prompt or ""
+    # Stagehand: each character's box rewrites her line in the prompt the pass uses
+    for path, edits in dict(char_store or {}).items():
+        own = prompts[path] if path in prompts else bshared.image_prompt(path)
+        edited = bshared.apply_character_edits(own, edits)
+        if edited != own:
+            prompts[path] = edited
 
     hires_params = {
         "denoising_strength": float(denoising_strength),
@@ -493,6 +500,7 @@ def batch_hires_fix_process_folders(
     hr_cfg,
     save_base_copy=False,
     prompt_store=None,
+    char_store=None,
 ):
     """
     Folder mode: hires-fix every pending base image in the selected Tests
@@ -533,6 +541,7 @@ def batch_hires_fix_process_folders(
         # Edits made after a "📥 Load for editing" still apply if the same
         # images are run from the folder button (both key on the real path).
         prompt_store=prompt_store,
+        char_store=char_store,
     )
 
 
@@ -847,6 +856,8 @@ def _build_ui_tab():
         # Per-image prompt overrides, {path: prompt}. An image with no entry runs
         # with the prompt read from its own infotext, as it always did.
         prompt_store = gr.State({})
+        # {path: [one per Stagehand character]}: the per-character boxes' edits
+        char_state = gr.State({})
         sel_state = gr.State(None)
 
         # Driven from javascript/batch_adetailer.js on right-click: gradio has no
@@ -946,6 +957,9 @@ def _build_ui_tab():
                     lines=8,
                     max_lines=24,
                 )
+
+                # Stagehand images: a box per character in the prompt above
+                char_boxes = bshared.character_boxes("txt2img_prompt_batch_char", "prompt")
 
                 with gr.Row():
                     revert_btn = gr.Button("↺ Revert to the image's own prompt", scale=1)
@@ -1084,6 +1098,26 @@ def _build_ui_tab():
             queue=False,
         )
 
+        # The character boxes follow the prompt box (the selected image's prompt, as edited):
+        # refreshed after everything that rewrites it, and as it's typed in.
+        def chars_refresh(chars, paths, sel, prompt):
+            path = paths[int(sel)] if paths and sel is not None and 0 <= int(sel) < len(paths) else None
+            return bshared.character_box_updates(prompt or "", (chars or {}).get(path), "prompt")
+
+        def chars_expand(chars, paths, sel, prompt):
+            """Right-click: every character's box written out from the prompt box."""
+            if not paths or sel is None or not 0 <= int(sel) < len(paths) or not bshared.image_characters(prompt):
+                return chars
+            return {**(chars or {}), paths[int(sel)]: bshared.expanded_characters(prompt)}
+
+        def chars_edit(chars, paths, sel, *boxes):
+            if not paths or sel is None or not 0 <= int(sel) < len(paths):
+                return chars
+            return {**(chars or {}), paths[int(sel)]: list(boxes)}
+
+        refresh = dict(fn=chars_refresh, inputs=[char_state, paths_state, sel_state, prompt_box], outputs=char_boxes,
+                       queue=False, show_progress="hidden")
+
         # Every loader writes the same batch: the gallery, the paths the run
         # reads, the selection, and the editor showing the first image.
         editor_outputs = [source_gallery, paths_state, sel_state, editing_md,
@@ -1094,14 +1128,14 @@ def _build_ui_tab():
             inputs=[folder_path, prompt_store],
             outputs=[*editor_outputs, save_to_source, status_text],
             queue=False,
-        )
+        ).then(**refresh)
 
         load_folders_btn.click(
             fn=_load_pending_folders,
             inputs=[folder_select, prompt_store],
             outputs=[*editor_outputs, save_to_source, status_text],
             queue=False,
-        )
+        ).then(**refresh)
 
         folder_btn.click(
             fn=batch_hires_fix_process_folders,
@@ -1118,6 +1152,7 @@ def _build_ui_tab():
                 hr_cfg,
                 save_base_copy,
                 prompt_store,
+                char_state,
             ],
             outputs=[output_gallery, status_text],
         ).then(  # the run consumed pending work — rescan so the list stays honest
@@ -1143,7 +1178,7 @@ def _build_ui_tab():
             inputs=[file_input, suffix_filter, prompt_store],
             outputs=[*editor_outputs, file_input, status_text],
             queue=False,
-        )
+        ).then(**refresh)
 
         # ── prompt editor ──
         source_gallery.select(
@@ -1151,7 +1186,7 @@ def _build_ui_tab():
             inputs=[prompt_store, paths_state],
             outputs=[sel_state, editing_md, prompt_box, preview_img],
             queue=False,
-        )
+        ).then(**refresh)
 
         rclick_btn.click(
             fn=_on_right_click,
@@ -1159,7 +1194,10 @@ def _build_ui_tab():
             outputs=[sel_state, editing_md, prompt_box, preview_img, prompt_store],
             queue=False,
             show_progress="hidden",
-        )
+        ).then(
+            fn=chars_expand, inputs=[char_state, paths_state, sel_state, prompt_box], outputs=char_state,
+            queue=False, show_progress="hidden",
+        ).then(**refresh)
 
         # .input, not .change: only a keystroke is an edit. A .change would also
         # fire when a *selection* rewrites the box, writing the newly loaded
@@ -1170,6 +1208,16 @@ def _build_ui_tab():
             outputs=[prompt_store],
             queue=False,
             show_progress="hidden",
+        ).then(**refresh)  # a character line added or removed shows or hides her box
+
+        # .input: a keystroke is an edit; a refresh setting the boxes is not
+        gr.on(
+            triggers=[b.input for b in char_boxes],
+            fn=chars_edit,
+            inputs=[char_state, paths_state, sel_state, *char_boxes],
+            outputs=char_state,
+            queue=False,
+            show_progress="hidden",
         )
 
         revert_btn.click(
@@ -1177,14 +1225,14 @@ def _build_ui_tab():
             inputs=[prompt_store, paths_state, sel_state],
             outputs=[prompt_store, prompt_box, status_text],
             queue=False,
-        )
+        ).then(**refresh)
 
         first_rev_btn.click(
             fn=_on_first_revision,
             inputs=[prompt_store, paths_state, sel_state],
             outputs=[prompt_store, prompt_box, status_text],
             queue=False,
-        )
+        ).then(**refresh)
 
         export_btn.click(
             fn=_export_prompts,
@@ -1220,6 +1268,7 @@ def _build_ui_tab():
                 prompt_store,
                 sel_state,
                 prompt_box,
+                char_state,
             ],
             outputs=[output_gallery, status_text],
         ).then(  # a save-to-source run consumed pending work — keep the list honest

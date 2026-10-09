@@ -578,6 +578,80 @@ def has_characters(prompt: str) -> bool:
     return bool(_CHARACTER_LINE_RE.search(prompt or ""))
 
 
+# Per-character prompt boxes (both tabs). Each starts as [PROMPT] -- her own prompt from the
+# image, as ADetailer's [PROMPT] is the image's -- and "[PROMPT], crying" adds to it; a
+# right-click on the thumbnail writes her prompt out to edit. The edits rewrite her
+# "Character N" line in the prompt, which Stagehand then gives her region (hires) or her face
+# (ADetailer). Reading and writing the lines is Stagehand's own (lib_stagehand), so the boxes
+# only appear with Stagehand installed.
+MAX_CHARACTERS = 10  # Stagehand's Character Prompts cards
+CHARACTER_PROMPT = "[PROMPT]"
+
+
+def _stagehand_lines():
+    try:
+        from lib_stagehand import characters
+    except Exception:
+        return None
+    return characters
+
+
+def image_characters(prompt: str) -> dict:
+    """{number: {"name", "box", "share", "text"}} of a prompt's Stagehand characters."""
+    lib = _stagehand_lines()
+    if lib is None or not has_characters(prompt):
+        return {}
+    return lib.read(prompt)[1]
+
+
+def character_text(edit, own: str) -> str:
+    """A character box applied to her own prompt: blank or [PROMPT] is hers as it is."""
+    edit = (edit or "").strip()
+    return own if not edit else edit.replace(CHARACTER_PROMPT, own)
+
+
+def apply_character_edits(prompt: str, edits) -> str:
+    """The prompt with each character's line rewritten from her box (edits: one per card
+    number, 1 first). Unchanged when every box is [PROMPT]."""
+    lib = _stagehand_lines()
+    chars = image_characters(prompt)
+    edits = list(edits or [])
+    new = {n: character_text(edits[n - 1] if n <= len(edits) else "", c["text"]) for n, c in chars.items()}
+    if all(new[n] == c["text"] for n, c in chars.items()):
+        return prompt
+    base = lib.read(prompt)[0]
+    return lib.show(base, [(n, c["name"], c["box"], new[n], c["share"]) for n, c in sorted(chars.items())])
+
+
+def expanded_characters(prompt: str) -> list:
+    """Every box written out: her prompt where she's in the image, [PROMPT] elsewhere."""
+    chars = image_characters(prompt)
+    return [chars[n]["text"] if n in chars else CHARACTER_PROMPT for n in range(1, MAX_CHARACTERS + 1)]
+
+
+def character_boxes(elem_prefix: str, what: str) -> list:
+    """The hidden per-character boxes; character_box_updates shows the image's. elem_prefix
+    gives them tag autocomplete (it keys on ADetailer's / txt2img's prompt ids)."""
+    return [gr.Textbox(value=CHARACTER_PROMPT, label=f"Character {n}: {what}", lines=2, max_lines=12, visible=False,
+                       elem_id=f"{elem_prefix}{n}",
+                       info=f"{CHARACTER_PROMPT} = her prompt in the image; '{CHARACTER_PROMPT}, crying' adds to it. "
+                            "Right-click the thumbnail to write it out.")
+            for n in range(1, MAX_CHARACTERS + 1)]
+
+
+def character_box_updates(prompt: str, edits, what: str) -> list:
+    """The boxes for one image: her name and box where she's in its prompt, hidden elsewhere."""
+    chars = image_characters(prompt)
+    edits = list(edits or [])
+    updates = []
+    for n in range(1, MAX_CHARACTERS + 1):
+        c = chars.get(n)
+        name = f" ({c['name']})" if c and c["name"] else ""
+        value = edits[n - 1] if n <= len(edits) and edits[n - 1] is not None else CHARACTER_PROMPT
+        updates.append(gr.update(visible=c is not None, label=f"Character {n}{name}: {what}", value=value))
+    return updates
+
+
 def replay_script_args(runner, script_args, params):
     """Let alwayson scripts that can rebuild their own args from an image's infotext do so
     (a script opts in with `args_from_infotext(params) -> list | None`); the rest keep their

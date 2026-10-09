@@ -7,7 +7,7 @@ import tempfile
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
-for _m in ("gradio", "PIL", "modules", "modules.infotext_utils", "modules_forge"):
+for _m in ("gradio", "gradio_client", "PIL", "modules", "modules.infotext_utils", "modules_forge"):
     sys.modules[_m] = MagicMock()
 
 _here = os.path.dirname(os.path.abspath(__file__))
@@ -351,6 +351,19 @@ else:
     assert bshared.has_characters("Character 2, share 30%: girl")
     assert not bshared.has_characters("a Character study\nCharacter design, 1girl")
     assert not bshared.has_characters("")
+
+    # Per-character boxes: [PROMPT] is her own prompt; an edit rewrites only her line
+    sys.path.insert(0, os.path.join(_here, "..", "forge-stagehand"))  # lib_stagehand reads/writes the lines
+    if bshared._stagehand_lines() is None:
+        print("skipped the character boxes: forge-stagehand isn't beside this extension")
+    else:
+        two = "2girls, park\n\nCharacter 1 (Ruby) at 0.000 0.000 0.500 1.000: girl, red hair\nCharacter 2, share 70%: girl, white hair"
+        assert bshared.apply_character_edits(two, ["[PROMPT]", ""]) == two  # untouched
+        edited = bshared.apply_character_edits(two, ["[PROMPT], crying", "girl, short white hair"])
+        assert edited == ("2girls, park\n\nCharacter 1 (Ruby) at 0.000 0.000 0.500 1.000: girl, red hair, crying\n"
+                          "Character 2, share 70%: girl, short white hair"), edited
+        assert bshared.expanded_characters(two)[:3] == ["girl, red hair", "girl, white hair", "[PROMPT]"]
+        assert bshared.apply_character_edits("no characters", ["x"]) == "no characters"
 
     # Scripts opt in to restoring their args from an image's infotext; the rest keep defaults.
     class Opts:  # restores itself

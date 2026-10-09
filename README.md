@@ -184,6 +184,14 @@ process, but with an empty prompt) and set the hires-fix parameters:
   settings from an image's metadata (`args_from_infotext`, used by Precise Reference) get them
   instead of their UI defaults (`replay_script_args`). Batch ADetailer leaves the prompt-editing
   collapse to Stagehand for those images, so each face gets only its own character.
+- **A prompt box per character** (Stagehand images): under the slots on Batch ADetailer (her
+  face prompt) and under the prompt on Batch Hires-Fix (her prompt in the hires pass), one
+  for each character in the selected image, named like `Character 2 (Ruby)`. Each starts as
+  `[PROMPT]`, her own prompt from the image; `[PROMPT], crying` adds to it, and anything else
+  replaces it. Right-click the thumbnail to write every character's prompt out to edit. The
+  edit rewrites her `Character N` line, so the result's PNG info shows what was used. The
+  boxes need forge-stagehand installed (they use its reader for those lines); they aren't in
+  the prompt export.
 
 ### Test-folder mode
 
