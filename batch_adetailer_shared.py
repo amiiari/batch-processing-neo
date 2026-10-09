@@ -16,11 +16,15 @@ UI), this module stays cached in sys.modules — the scripts importlib.reload()
 it so code edits still land, and the script-args cache below is keyed on the
 runner's identity for the same reason.
 """
+import base64
 import filecmp
+import io
+import json
 import os
 import re
 import sys
 import tempfile
+import urllib.request
 import weakref
 
 import gradio as gr
@@ -28,6 +32,15 @@ from PIL import Image
 
 from modules import images, shared
 from modules.infotext_utils import parse_generation_parameters
+
+# A forge link slot (FORGELINK_SLOT is set in its environment) renders the UI and nothing
+# else: each image is sent to the owner's Forge (the endpoints under API, in the two tab
+# scripts) through forge link's prompt check and GPU queue, and the result is saved here.
+# Nothing in a slot may touch the owner's folders: no scan roots, no folder listing, no saving
+# beside a source, no export. Those are refused below and hidden in the tabs.
+SLOT = os.environ.get("FORGELINK_SLOT", "")
+HOST = os.environ.get("FORGELINK_HOST", "http://127.0.0.1:7860")
+API = "/batch-processing/v1"
 
 def _patch_select_check():
     """Forge serves an image it already saved straight from disk (modules/ui_tempdir registers
@@ -172,6 +185,8 @@ def is_dragged_temp_copy(path):
 
 def image_stems(folder):
     """{stem: filename} for every image in `folder`, in natural order."""
+    if SLOT:
+        return {}  # every folder listing comes through here: none in a slot
     try:
         files = sorted(os.listdir(folder), key=natural_key)
     except OSError:
@@ -217,6 +232,8 @@ def pending_inputs(folder, stage):
 
 def scan_roots(stage):
     """Existing directories from the stage's scan-roots setting."""
+    if SLOT:
+        return []
     roots = getattr(shared.opts, f"{stage.opt_prefix}_scan_roots", "") or ""
     return [r for r in (r.strip() for r in roots.split(";")) if r and os.path.isdir(r)]
 
@@ -650,6 +667,87 @@ def character_box_updates(prompt: str, edits, what: str) -> list:
         value = edits[n - 1] if n <= len(edits) and edits[n - 1] is not None else CHARACTER_PROMPT
         updates.append(gr.update(visible=c is not None, label=f"Character {n}{name}: {what}", value=value))
     return updates
+
+
+# ──────────────────────────────────────────────
+# Running in a forge link slot
+# ──────────────────────────────────────────────
+def file_b64(path):
+    """A file's bytes as base64: the PNG info travels with the image."""
+    with open(path, "rb") as f:
+        return base64.b64encode(f.read()).decode()
+
+
+def image_from_b64(data):
+    """(RGB image, its PNG info or None) from file_b64's text."""
+    img = Image.open(io.BytesIO(base64.b64decode(data)))
+    geninfo, _items = images.read_info_from_image(img)
+    return img.convert("RGB"), geninfo
+
+
+def image_to_b64(img, info=None):
+    """A result as PNG base64, its infotext in it."""
+    from PIL import PngImagePlugin
+    meta = PngImagePlugin.PngInfo()
+    if info:
+        meta.add_text("parameters", info)
+    buf = io.BytesIO()
+    img.save(buf, format="PNG", pnginfo=meta)
+    return base64.b64encode(buf.getvalue()).decode()
+
+
+def host_get(route, timeout=30):
+    with urllib.request.urlopen(f"{HOST}{API}{route}", timeout=timeout) as r:
+        return json.load(r)
+
+
+def run_remote(route, body, prompt, negative, width, height, cancelled=None):
+    """One image on the owner's Forge, through forge link (its blocklist, size cap and GPU
+    queue). -> (images, infotexts, error or None, notes), like _process_single_image."""
+    link = getattr(shared, "forgelink", None)
+    if link is None:
+        return [], [], "forge link's gate isn't loaded in this slot, so nothing can run. Tell amiiari.", []
+    try:
+        result = link.run_on_host(API + route, body, prompt, negative, width, height, cancelled=cancelled)
+    except link.Refused as e:
+        return [], [], str(e), []
+    pics = [image_from_b64(b)[0] for b in result.get("images") or []]
+    return pics, result.get("infotexts") or [""] * len(pics), result.get("error"), result.get("notes") or []
+
+
+def save_in_slot(pics, infotexts, outdir, stem, suffix):
+    """A slot's results: <stem><suffix>.png in its own outputs (-1, -2... on a clash), and
+    forge link told which files they are (its gallery and keeper). -> the paths."""
+    os.makedirs(outdir, exist_ok=True)
+    written = []
+    for i, img in enumerate(pics):
+        base = f"{stem}{suffix}" if i == 0 else f"{stem}{suffix}-{i}"
+        name, n = base, 1
+        while os.path.exists(os.path.join(outdir, f"{name}.png")):
+            name, n = f"{base}-{n}", n + 1
+        path = os.path.join(outdir, f"{name}.png")
+        with open(path, "wb") as f:
+            f.write(base64.b64decode(image_to_b64(img, infotexts[i] if i < len(infotexts) else None)))
+        written.append(path)
+    link = getattr(shared, "forgelink", None)
+    if link is not None and written:
+        link.report_files(written)
+    return written
+
+
+def run_on_main(job, fn, *args):
+    """fn(*args) on Forge's main thread, holding the queue lock as a generation does (the
+    owner's endpoints). -> (fn's result, whether it was interrupted)."""
+    from modules import call_queue
+    from modules_forge import main_thread
+    with call_queue.queue_lock:
+        shared.state.begin(job=job)
+        try:
+            result = main_thread.run_and_wait_result(fn, *args)
+        finally:
+            stopped = shared.state.interrupted or shared.state.stopping_generation
+            shared.state.end()
+    return result, stopped
 
 
 def replay_script_args(runner, script_args, params):

@@ -249,8 +249,9 @@ def _process_single_image(img: Image.Image, geninfo: str | None, hires_params: d
 
         p.override_settings["save_images_before_highres_fix"] = False
 
-        if save_opts.get("use_original_name"):
-            # We save manually afterwards with the original filename + suffix.
+        if save_opts.get("use_original_name") or save_opts.get("discard"):
+            # Saved by hand afterwards with the original filename + suffix -- or, for a
+            # forge link slot's image, not here at all: the slot saves it.
             p.do_not_save_samples = True
 
         with closing(p):
@@ -320,6 +321,8 @@ def batch_hires_fix_process(
     if not files:
         yield [], "No images to process. Please drag and drop some images first."
         return
+    if bshared.SLOT:
+        save_to_source = save_base_copy = False
 
     skip_errors = shared.opts.batch_hires_fix_skip_errors
 
@@ -432,20 +435,28 @@ def batch_hires_fix_process(
         # Real generations get this from the UI's wrap_gradio_gpu_call wrapper.
         # queue_lock, like wrap_gradio_gpu_call: without it a txt2img/API job and
         # this image would share shared.state, each begin()/end() clobbering the other.
-        with call_queue.queue_lock:
-            shared.state.begin(job="batch_hires_fix")
-            try:
-                # GPU work must run on Forge's main thread, same as the ✨ button
-                # (txt2img.py routes through main_thread.run_and_wait_result).
-                result_images, _infotexts, error_tb, notes = main_thread.run_and_wait_result(
-                    _process_single_image, img, geninfo, hires_params, save_opts,
-                    prompt_override,
-                )
-            finally:
-                # Read before end() and inside the lock: once released, the next
-                # job's begin() resets these flags.
-                stopped = shared.state.interrupted or shared.state.stopping_generation
-                shared.state.end()
+        if bshared.SLOT:
+            # forge link: the owner's Forge runs it (checked, queued), this slot keeps it
+            yield all_results, f"[{idx + 1}/{total}] {name}: waiting for the GPU / running..."
+            result_images, _infotexts, error_tb, notes = _run_in_slot(
+                image_path, img, geninfo, hires_params, prompt_override, filename_suffix,
+                cancelled=lambda: bshared.cancel_requested(STAGE, my_run))
+            stopped = False
+        else:
+            with call_queue.queue_lock:
+                shared.state.begin(job="batch_hires_fix")
+                try:
+                    # GPU work must run on Forge's main thread, same as the ✨ button
+                    # (txt2img.py routes through main_thread.run_and_wait_result).
+                    result_images, _infotexts, error_tb, notes = main_thread.run_and_wait_result(
+                        _process_single_image, img, geninfo, hires_params, save_opts,
+                        prompt_override,
+                    )
+                finally:
+                    # Read before end() and inside the lock: once released, the next
+                    # job's begin() resets these flags.
+                    stopped = shared.state.interrupted or shared.state.stopping_generation
+                    shared.state.end()
 
         shared.total_tqdm.clear()
 
@@ -487,6 +498,50 @@ def batch_hires_fix_process(
 
     yield all_results, status_text
 
+def _run_in_slot(image_path, img, geninfo, hires_params, prompt_override, suffix, cancelled):
+    """A forge link slot's image: run on the owner's Forge (the /hires endpoint below), checked
+    at the size it comes out, and saved in this slot. -> like _process_single_image."""
+    params = bshared.parse_generation_parameters(geninfo or "", [])
+    prompt = prompt_override if prompt_override is not None else params.get("Prompt", "")
+    rx, ry = int(hires_params.get("hr_resize_x") or 0), int(hires_params.get("hr_resize_y") or 0)
+    if rx or ry:
+        width, height = rx or round(img.width * ry / img.height), ry or round(img.height * rx / img.width)
+    else:
+        scale = float(hires_params.get("hr_scale") or 1)
+        width, height = round(img.width * scale), round(img.height * scale)
+    body = {"image": bshared.file_b64(image_path), "hires_params": hires_params, "prompt_override": prompt_override}
+    pics, infotexts, error, notes = bshared.run_remote("/hires", body, prompt, params.get("Negative prompt", ""),
+                                                      width, height, cancelled=cancelled)
+    if pics:
+        outdir = (getattr(shared.opts, "batch_hires_fix_output_dir", None) or shared.opts.outdir_samples
+                  or shared.opts.outdir_txt2img_samples)
+        bshared.save_in_slot(pics, infotexts, outdir, os.path.splitext(os.path.basename(image_path))[0],
+                             suffix or "-hires")
+    return pics, infotexts, error, notes
+
+
+def _hires_endpoint(body):
+    """The owner's side of a slot's image: hires-fix it here, save nothing, send it back."""
+    img, geninfo = bshared.image_from_b64(body["image"])
+    (pics, infotexts, error, notes), stopped = bshared.run_on_main(
+        "batch_hires_fix", _process_single_image, img, geninfo, body.get("hires_params") or {},
+        {"discard": True}, body.get("prompt_override"))
+    return {"images": [bshared.image_to_b64(im, infotexts[k] if k < len(infotexts) else None) for k, im in enumerate(pics)],
+            "infotexts": infotexts, "notes": notes,
+            "error": error or ("Stopped on amiiari's Forge." if stopped and not pics else None)}
+
+
+def _on_app_started(_demo, app):
+    if bshared.SLOT:
+        return  # a slot only sends; the owner's Forge runs
+    from fastapi import Body
+
+    def hires(body: dict = Body(...)):
+        return _hires_endpoint(body)
+
+    app.add_api_route(f"{bshared.API}/hires", hires, methods=["POST"])
+
+
 def batch_hires_fix_process_folders(
     folders,
     denoising_strength,
@@ -507,6 +562,9 @@ def batch_hires_fix_process_folders(
     folders, saving each result (plus its -base Lanczos twin, if ticked) back
     into the folder it came from.
     """
+    if bshared.SLOT:
+        yield [], "Folders aren't available here: drop your images in instead."
+        return
     if not folders:
         yield [], "No folders selected — tick at least one (🔄 Rescan if the list is stale)."
         return
@@ -710,6 +768,8 @@ def _on_first_revision(store, paths, sel):
     """📜 fill the box with the prompt from this image's first revision."""
     if sel is None or not paths or not (0 <= int(sel) < len(paths)):
         return store, gr.update(), "Click a thumbnail first."
+    if bshared.SLOT:
+        return store, gr.update(), "Not available here."
     path = paths[int(sel)]
     prompt, note = _first_revision_prompt(path)
     if prompt is None:
@@ -722,6 +782,8 @@ def _on_first_revision(store, paths, sel):
 def _export_prompts(store, paths, folder):
     """Snapshot the edited prompts (keyed by <set>/<file>) into a timestamped JSON,
     so they survive a restart."""
+    if bshared.SLOT:
+        return "Export isn't available here."
     if not paths:
         return "Nothing to export — load images first."
     folder = (folder or "").strip().strip('"')
@@ -868,7 +930,7 @@ def _build_ui_tab():
         rclick_btn = gr.Button(visible=False, elem_id="batch_hires_fix_rclick_btn")
 
         # Test Folders panel spans the full width at the top, like the ADetailer tab.
-        with gr.Accordion("📁 Test Folders — hires-fix in place", open=True):
+        with gr.Accordion("📁 Test Folders — hires-fix in place", open=True, visible=not bshared.SLOT):
             folder_select = _folder_choices()
             with gr.Row():
                 folder_btn = gr.Button(
@@ -909,9 +971,15 @@ def _build_ui_tab():
                      "Empty = load everything.",
                 max_lines=1,
                 scale=1,
+                visible=not bshared.SLOT,
             )
+            if bshared.SLOT:
+                # A slot's uploads are all meant (it can't drag folders in), and the slots'
+                # ui-config.json was seeded with a stale saved filter ("-adetailer" here), which
+                # would silently skip every image: no filter, and none loaded from there.
+                suffix_filter.do_not_save_to_config = True
 
-        with gr.Accordion("💾 Export / import per-image prompts", open=False):
+        with gr.Accordion("💾 Export / import per-image prompts", open=False, visible=not bshared.SLOT):
             with gr.Row():
                 export_dir = gr.Textbox(
                     value="",
@@ -963,7 +1031,7 @@ def _build_ui_tab():
 
                 with gr.Row():
                     revert_btn = gr.Button("↺ Revert to the image's own prompt", scale=1)
-                    first_rev_btn = gr.Button("📜 Use the first revision's prompt", scale=1)
+                    first_rev_btn = gr.Button("📜 Use the first revision's prompt", scale=1, visible=not bshared.SLOT)
 
                 gr.Markdown("### Hires-Fix Settings")
 
@@ -1027,6 +1095,7 @@ def _build_ui_tab():
                         value=True,
                         label="Save as original filename + suffix",
                         scale=2,
+                        visible=not bshared.SLOT,  # a slot always does
                     )
                     filename_suffix = gr.Textbox(
                         value="-hires",
@@ -1037,6 +1106,7 @@ def _build_ui_tab():
 
                 save_base_copy = gr.Checkbox(
                     value=False,
+                    visible=not bshared.SLOT,
                     label="Also save a plain Lanczos upscale with no hires pass "
                           "(<name>-base.png, same size as the result)",
                 )
@@ -1044,8 +1114,9 @@ def _build_ui_tab():
                 # Ticked automatically by "📂 Load Folder". Forces <name>-hires.png,
                 # so the suffix box above is ignored while this is on.
                 save_to_source = gr.Checkbox(
-                    value=True,
+                    value=not bshared.SLOT,
                     label="Save as <name>-hires.png into each image's own folder",
+                    visible=not bshared.SLOT,
                 )
 
                 with gr.Row():
@@ -1292,3 +1363,4 @@ def _on_ui_tabs():
 # ──────────────────────────────────────────────
 _register_settings()
 script_callbacks.on_ui_tabs(_on_ui_tabs)
+script_callbacks.on_app_started(_on_app_started)

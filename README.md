@@ -226,6 +226,27 @@ or one that keeps images outside a `Tests` folder — paste its path into the
 **📂 Load Folder** box (re-runs land as `<name>-hires-1.png` /
 `<name>-hires-adetailer-1.png`, originals are never overwritten).
 
+## In forge link slots
+
+In a [forge link](https://github.com/amiiari/forge-link) slot (`FORGELINK_SLOT` set), both
+tabs are a front end: each dropped image is sent to the owner's Forge, which runs it with
+the same code as here and sends it back without saving anything. The slot saves it in its
+own outputs (`<name>-hires.png` in txt2img, `<name>-adetailer.png` in img2img).
+
+- Each image goes through forge link's gate (`shared.forgelink.run_on_host`): its prompt
+  (with every character edit and ADetailer prompt) and its final size are checked
+  against the blocklist and size cap first, it waits its turn in the GPU queue (one turn
+  per image, so others can generate in between), and the infotext that comes back is
+  checked again.
+- Batch ADetailer offers the owner's ADetailer units, read from her Forge.
+- Nothing that touches the owner's disk is there: no test folders, folder loading,
+  save-beside-the-source, `-base` copy, prompt export or first-revision lookup. Those are
+  hidden, and refused server-side (folder listing returns nothing, scan roots are empty)
+  whatever a client sends. The filename filter is off too.
+- The owner's endpoints are `POST /batch-processing/v1/hires`, `POST
+  /batch-processing/v1/adetailer` and `GET /batch-processing/v1/adetailer-units` on her
+  Forge (local only, registered only where `FORGELINK_SLOT` isn't set).
+
 ## Settings
 
 Under **Settings → Batch ADetailer** and **Settings → Batch Hires-Fix** (each

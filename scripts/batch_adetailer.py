@@ -163,6 +163,8 @@ def _get_num_slots():
     setting, which decides how many gr.State unit slots its script_args slice has
     (2 leading bools + one slot per unit).
     """
+    if bshared.SLOT:
+        return len(_get_adetailer_defaults()) or DEFAULT_NUM_SLOTS
     ad_script = _find_adetailer_script()
     if ad_script is None:
         return DEFAULT_NUM_SLOTS
@@ -190,7 +192,14 @@ def _get_adetailer_defaults():
 
     MUST be called at event/click time — at UI-build time UiLoadsave hasn't run
     yet and this returns stock defaults.
+
+    In a forge link slot (no ADetailer there): the owner's, from her Forge.
     """
+    if bshared.SLOT:
+        try:
+            return bshared.host_get("/adetailer-units").get("units") or []
+        except Exception:
+            return []
     ad_script = _find_adetailer_script()
     if ad_script is None or not getattr(ad_script, "controls", None):
         return []
@@ -220,7 +229,12 @@ def _ad_field_names():
     Valid ADetailerArgs field names. The model is `extra=Extra.forbid`, so a
     single stray key makes the whole unit fail validation and get dropped
     silently — everything we hand over gets filtered through this.
+
+    None in a forge link slot: it has no ADetailer to ask, so nothing is dropped there and
+    the owner's Forge filters with its own (the /adetailer endpoint).
     """
+    if bshared.SLOT:
+        return None
     try:
         model = sys.modules["adetailer"].ADetailerArgs
         fields = set(getattr(model, "__fields__", None) or model.model_fields)
@@ -319,7 +333,7 @@ def _config_to_unit_dicts(config, defaults, num_slots):
             continue
 
         allowed = _ad_field_names()
-        units.append({k: v for k, v in unit.items() if k in allowed})
+        units.append({k: v for k, v in unit.items() if allowed is None or k in allowed})
 
     return units
 
@@ -569,6 +583,8 @@ def _process_single_image(img: Image.Image, geninfo: str | None, unit_dicts: lis
             return [], [], None, notes
 
         fix_info = lambda t: _fix_infotext(t, orig_size[0], orig_size[1], orig_steps, orig_sampler)
+        if save_opts.get("discard"):  # a forge link slot's image: the slot saves it
+            return processed.images, [fix_info(t) for t in processed.infotexts], None, notes
         if save_opts.get("use_original_name"):
             bshared.save_with_original_name(processed, p, save_opts, fix_info=fix_info)
         else:
@@ -582,6 +598,54 @@ def _process_single_image(img: Image.Image, geninfo: str | None, unit_dicts: lis
         tb = traceback.format_exc()
         print(f"[Batch ADetailer] Error processing image:\n{tb}")
         return [], [], tb, notes
+
+
+def _run_in_slot(image_path, img, geninfo, unit_dicts, char_edits, suffix, cancelled):
+    """A forge link slot's image: run on the owner's Forge (the /adetailer endpoint below), the
+    prompt its faces get checked first (the image's, her edits, every unit's), and saved in this
+    slot. -> like _process_single_image."""
+    params = bshared.parse_generation_parameters(geninfo or "", [])
+    prompt = bshared.apply_character_edits(params.get("Prompt", ""), char_edits)
+    prompt = "\n".join([prompt] + [u.get("ad_prompt") or "" for u in unit_dicts])
+    negative = "\n".join([params.get("Negative prompt", "")] + [u.get("ad_negative_prompt") or "" for u in unit_dicts])
+    body = {"image": bshared.file_b64(image_path), "unit_dicts": unit_dicts, "char_edits": char_edits}
+    pics, infotexts, error, notes = bshared.run_remote("/adetailer", body, prompt, negative, img.width, img.height,
+                                                      cancelled=cancelled)
+    if pics:
+        outdir = (getattr(shared.opts, "batch_adetailer_output_dir", None) or shared.opts.outdir_samples
+                  or shared.opts.outdir_img2img_samples)
+        bshared.save_in_slot(pics, infotexts, outdir, os.path.splitext(os.path.basename(image_path))[0],
+                             suffix or "-adetailer")
+    return pics, infotexts, error, notes
+
+
+def _adetailer_endpoint(body):
+    """The owner's side of a slot's image: ADetailer it here with her units, save nothing,
+    send it back."""
+    img, geninfo = bshared.image_from_b64(body["image"])
+    allowed = _ad_field_names()
+    units = [{k: v for k, v in u.items() if k in allowed} for u in body.get("unit_dicts") or []]
+    (pics, infotexts, error, notes), stopped = bshared.run_on_main(
+        "batch_adetailer", _process_single_image, img, geninfo, units, {"discard": True}, body.get("char_edits"))
+    return {"images": [bshared.image_to_b64(im, infotexts[k] if k < len(infotexts) else None) for k, im in enumerate(pics)],
+            "infotexts": infotexts, "notes": notes,
+            "error": error or ("Stopped on amiiari's Forge." if stopped and not pics else None)}
+
+
+def _on_app_started(_demo, app):
+    if bshared.SLOT:
+        return  # a slot only sends; the owner's Forge runs
+    from fastapi import Body
+
+    def adetailer(body: dict = Body(...)):
+        return _adetailer_endpoint(body)
+
+    def units():
+        # read at request time: see _get_adetailer_defaults (the saved defaults)
+        return {"units": _get_adetailer_defaults()}
+
+    app.add_api_route(f"{bshared.API}/adetailer", adetailer, methods=["POST"])
+    app.add_api_route(f"{bshared.API}/adetailer-units", units, methods=["GET"])
 
 
 def batch_adetailer_run_selected(store, paths, sel, use_original_name, filename_suffix, save_to_source, char_store,
@@ -625,7 +689,9 @@ def batch_adetailer_process(store, paths, sel, use_original_name, filename_suffi
         yield "No images to process. Please drag and drop some images first."
         return
 
-    if _find_adetailer_script() is None:
+    if bshared.SLOT:
+        save_to_source = False
+    elif _find_adetailer_script() is None:
         yield (
             "❌ ADetailer not found on the img2img tab.\n\n"
             "This extension drives the ADetailer extension (aadetailer-neoforge) — "
@@ -739,9 +805,15 @@ def batch_adetailer_process(store, paths, sel, use_original_name, filename_suffi
             try:
                 # GPU work must run on Forge's main thread, same as img2img()
                 # (img2img.py routes through main_thread.run_and_wait_result).
-                result_images, _infotexts, error_tb, notes = main_thread.run_and_wait_result(
-                    _process_single_image, img, geninfo, unit_dicts, save_opts, char_store.get(image_path)
-                )
+                if bshared.SLOT:
+                    # forge link: the owner's Forge runs it (checked, queued), this slot keeps it
+                    result_images, _infotexts, error_tb, notes = _run_in_slot(
+                        image_path, img, geninfo, unit_dicts, char_store.get(image_path), filename_suffix,
+                        cancelled=lambda: bshared.cancel_requested(STAGE, my_run))
+                else:
+                    result_images, _infotexts, error_tb, notes = main_thread.run_and_wait_result(
+                        _process_single_image, img, geninfo, unit_dicts, save_opts, char_store.get(image_path)
+                    )
             finally:
                 # Read before end() and inside the lock: once released, the next
                 # job's begin() resets these flags.
@@ -1029,6 +1101,8 @@ def _on_apply_to_all(store, paths, sel, *control_values):
 def _export_prompts(store, paths, folder):
     """Snapshot every loaded image's slot configs (keyed by <set>/<file>) into a
     timestamped JSON file, so the per-image prompts survive a restart."""
+    if bshared.SLOT:
+        return "Export isn't available here."
     if not paths:
         return "Nothing to export — load images first."
     folder = (folder or "").strip().strip('"')
@@ -1241,7 +1315,7 @@ def _build_ui_tab():
         rclick_prompt = gr.Textbox(visible=False, elem_id="batch_adetailer_rclick_prompt")
         rclick_btn = gr.Button(visible=False, elem_id="batch_adetailer_rclick_btn")
 
-        with gr.Accordion("📁 Test Folders — load pending -hires images", open=True):
+        with gr.Accordion("📁 Test Folders — load pending -hires images", open=True, visible=not bshared.SLOT):
             folder_select = _folder_choices()
             with gr.Row():
                 load_btn = gr.Button("📥 Load Selected Folders", variant="primary", scale=3)
@@ -1271,14 +1345,20 @@ def _build_ui_tab():
                 scale=4,
             )
             suffix_filter = gr.Textbox(
-                value="-hires",
+                value="" if bshared.SLOT else "-hires",
                 label="Only load files ending with",
                 info="Drag a whole folder's worth in — anything else is skipped. Empty = load everything.",
                 max_lines=1,
                 scale=1,
+                visible=not bshared.SLOT,
             )
+            if bshared.SLOT:
+                # A slot's uploads are all meant (it can't drag folders in), and the slots'
+                # ui-config.json was seeded with a stale saved filter ("-adetailer" here), which
+                # would silently skip every image: no filter, and none loaded from there.
+                suffix_filter.do_not_save_to_config = True
 
-        with gr.Accordion("💾 Export / import per-image prompts", open=False):
+        with gr.Accordion("💾 Export / import per-image prompts", open=False, visible=not bshared.SLOT):
             with gr.Row():
                 export_dir = gr.Textbox(
                     value="",
@@ -1333,6 +1413,7 @@ def _build_ui_tab():
                         value=True,
                         label="Save as original filename + suffix",
                         scale=2,
+                        visible=not bshared.SLOT,  # a slot always does
                     )
                     filename_suffix = gr.Textbox(
                         value="-adetailer",
@@ -1343,8 +1424,9 @@ def _build_ui_tab():
 
                 # Ticked automatically by "Load Selected Folders".
                 save_to_source = gr.Checkbox(
-                    value=True,
+                    value=not bshared.SLOT,
                     label="Save as <name>-adetailer.png into each image's own folder",
+                    visible=not bshared.SLOT,
                 )
 
                 with gr.Row():
@@ -1599,3 +1681,4 @@ def _on_ui_tabs():
 # ──────────────────────────────────────────────
 _register_settings()
 script_callbacks.on_ui_tabs(_on_ui_tabs)
+script_callbacks.on_app_started(_on_app_started)
