@@ -29,6 +29,34 @@ from PIL import Image
 from modules import images, shared
 from modules.infotext_utils import parse_generation_parameters
 
+def _patch_select_check():
+    """Forge serves an image it already saved straight from disk (modules/ui_tempdir registers
+    the file) instead of copying it into Gradio's cache. Clicking that image in a gallery whose
+    .select takes gr.SelectData then fails Gradio's check that event files are in its cache:
+    "File ...\\NrM-hires.png is not in the cache folder and cannot be accessed" (a result this
+    session wrote, shown again in a source gallery). Files Forge registered pass; anything else
+    is checked as before. Idempotent: this module is importlib.reload()ed."""
+    from gradio import processing_utils
+    from gradio_client import utils as client_utils
+    from modules import ui_tempdir
+
+    original = getattr(processing_utils.check_all_files_in_cache, "__wrapped__", processing_utils.check_all_files_in_cache)
+
+    def served(d):
+        path = d.get("path") or ""
+        if path and shared.demo is not None and ui_tempdir.check_tmp_file(shared.demo, path.rsplit("?", 1)[0]):
+            return {**d, "path": ""}
+        return d
+
+    def check(data):
+        original(client_utils.traverse(data, served, client_utils.is_file_obj))
+
+    check.__wrapped__ = original
+    processing_utils.check_all_files_in_cache = check
+
+
+_patch_select_check()
+
 _IMAGE_EXTS = (".png", ".jpg", ".jpeg", ".webp", ".jxl", ".avif", ".heif")
 _VARIANT_TOKENS = ("-adetailer", "-hires", "-edited", "-base")
 
